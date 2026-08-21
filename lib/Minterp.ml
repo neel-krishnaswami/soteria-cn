@@ -33,7 +33,7 @@ module ExprM = struct
   let returned (v : Core_value.t) : 'a t = InterpM.ok (Returned v)
 
   let fold_list (xs : 'a list) ~(init : 'b) ~(f : 'b -> 'a -> 'b t) : 'b t =
-    Monad.foldM ~init ~return:ok ~bind ~fold:Foldable.List.fold xs ~f
+    Monad.foldM (module List) ~init ~return:ok ~bind xs ~f
 
   let map_list (xs : 'a list) ~(f : 'a -> 'b t) : 'b list t =
     fold_list ~init:[] xs ~f:(fun acc a -> map (fun b -> b :: acc) (f a))
