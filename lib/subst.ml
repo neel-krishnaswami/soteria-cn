@@ -73,6 +73,53 @@ let eval_tconst : Cn.Terms.const -> Core_value.t = function
   | Null -> Obj (Core_value.Ptr Typed.Ptr.null)
   | _ -> raise Not_impl_const
 
+
+(* ───────────────────────── ADT term helpers ───────────────────────── *)
+
+module AE = Soteria_c_vendor.Adt_ext
+module HAdt = Soteria_c_helpers.Adt
+
+(* With the transparent [Typed], every ['a Typed.t] is an svalue, so these
+   conversions are mere repackagings. *)
+let sv_of_cv (desc : AE.sort_desc) (v : Core_value.t) : Typed.Svalue.t option =
+  match desc with
+  | DBool -> Core_value.cast_bool v
+  | DBits _ -> Core_value.cast_int v
+  | DPtr _ | DLoc _ -> Core_value.cast_ptr v
+  | DAdt _ -> Core_value.cast_adt v
+
+let cv_of_desc (desc : AE.sort_desc) (sv : Typed.Svalue.t) : Core_value.t =
+  match desc with
+  | DBool -> Bool sv
+  | DBits _ -> Obj (Int sv)
+  | DPtr _ | DLoc _ -> Obj (Ptr sv)
+  | DAdt _ -> Adt sv
+
+let ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
+  match desc with
+  | DBool -> Soteria.Bv_values.Svalue.TBool
+  | DBits n -> Soteria.Bv_values.Svalue.TBitVector n
+  | DPtr n -> Soteria.Bv_values.Svalue.TPointer n
+  | DLoc n -> Soteria.Bv_values.Svalue.TLoc n
+  | DAdt a -> Typed.t_adt a
+
+let ite_val ~of_opt_not_impl ~fail g (b1 : Core_value.t) (b2 : Core_value.t) :
+    Core_value.t =
+  match b1 with
+  | Loaded (Spec (Int i1)) | Obj (Int i1) ->
+      let i2 = Core_value.cast_int b2 |> of_opt_not_impl in
+      Core_value.Obj (Int (Typed.ite g i1 i2))
+  | Loaded (Spec (Ptr p1)) | Obj (Ptr p1) ->
+      let p2 = Core_value.cast_ptr b2 |> of_opt_not_impl in
+      Obj (Ptr (Typed.ite g p1 p2))
+  | Bool o1 ->
+      let o2 = Core_value.cast_bool b2 |> of_opt_not_impl in
+      Bool (Typed.ite g o1 o2)
+  | Adt a1 ->
+      let a2 = Core_value.cast_adt b2 |> of_opt_not_impl in
+      Adt (Typed.ite g a1 a2)
+  | _ -> fail ()
+
 let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
   let not_impl () = raise (Not_implemented annot) in
   let of_opt_not_impl = function None -> not_impl () | Some x -> x in
@@ -143,21 +190,81 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
       let b1 = eval_annot subst b1 in
       let b2 = eval_annot subst b2 in
       let g = Core_value.cast_bool g |> of_opt_not_impl in
-      (* Ok this is a bit digusting, we'll fix it later, it's a simple fix, but a bit of a refactor *)
-      match b1 with
-      | Loaded (Spec (Int b1)) | Obj (Int b1) ->
-          let b2 = Core_value.cast_int b2 |> of_opt_not_impl in
-          Obj (Int (Typed.ite g b1 b2))
-      | Loaded (Spec (Ptr b1)) | Obj (Ptr b1) ->
-          let b2 = Core_value.cast_ptr b2 |> of_opt_not_impl in
-          Obj (Ptr (Typed.ite g b1 b2))
-      | Bool b1 ->
-          let b2 = Core_value.cast_bool b2 |> of_opt_not_impl in
-          Core_value.Bool (Typed.ite g b1 b2)
-      | _ -> not_impl ())
+      ite_val ~of_opt_not_impl ~fail:not_impl g b1 b2)
   | Good (_, _) ->
       (* Are those pointer invariants? I don't think it should be separate from the chunk? *)
       Core_value.true_
+  | Constructor (con_sym, field_annots) -> (
+      let adt =
+        match _bt with
+        | Cn.BaseTypes.Datatype s -> HAdt.adt_name s
+        | _ -> not_impl ()
+      in
+      let con = HAdt.adt_name con_sym in
+      match AE.find_con adt con with
+      | None -> not_impl ()
+      | Some cdef ->
+          let arg_of (fname, desc) =
+            field_annots
+            |> List.find_map (fun (id, a) ->
+                if String.equal (Id.get_string id) fname then Some a else None)
+            |> of_opt_not_impl
+            |> eval_annot subst
+            |> sv_of_cv desc
+            |> of_opt_not_impl
+          in
+          let args = List.map arg_of cdef.fields in
+          Core_value.Adt (Typed.adt_constr ~adt ~con args))
+  | Match (scrut, cases) -> (
+      let (IT (_, sbt, _)) = scrut in
+      let scrut_adt =
+        match sbt with
+        | Cn.BaseTypes.Datatype s -> HAdt.adt_name s
+        | _ -> not_impl ()
+      in
+      let sv = eval_annot subst scrut |> Core_value.cast_adt |> of_opt_not_impl in
+      (* Compile a pattern against value [v] of datatype [adt]: yields the
+         match guard and the pattern-variable bindings (as selector chains). *)
+      let rec compile_pat adt (v : Typed.Svalue.t) (Cn.Terms.Pat (p, pbt, _)) =
+        match p with
+        | Cn.Terms.PWild -> (Typed.v_true, [])
+        | PSym s ->
+            let desc = HAdt.desc_of_bt pbt |> of_opt_not_impl in
+            (Typed.v_true, [ (s, cv_of_desc desc v) ])
+        | PConstructor (con_sym, fpats) ->
+            let con = HAdt.adt_name con_sym in
+            let guard = Typed.adt_tester ~con v in
+            List.fold_left
+              (fun (g, binds) (fid, subpat) ->
+                let field = Id.get_string fid in
+                let desc = AE.field_sort adt con field |> of_opt_not_impl in
+                let child =
+                  Typed.adt_sel ~adt ~con ~field ~field_ty:(ty_of_desc desc) v
+                in
+                let adt' = match desc with AE.DAdt a -> a | _ -> adt in
+                let g', binds' = compile_pat adt' child subpat in
+                (Typed.Bool.and_ g g', binds @ binds'))
+              (guard, []) fpats
+      in
+      let eval_case binds body =
+        let subst =
+          List.fold_left (fun s (sym, v) -> add sym v s) subst binds
+        in
+        eval_annot subst body
+      in
+      match List.rev cases with
+      | [] -> not_impl ()
+      | (last_pat, last_body) :: earlier_rev ->
+          (* The last case is the default branch of the ite chain. *)
+          let _, last_binds = compile_pat scrut_adt sv last_pat in
+          let init = eval_case last_binds last_body in
+          List.fold_left
+            (fun acc (pat, body) ->
+              let guard, binds = compile_pat scrut_adt sv pat in
+              ite_val ~of_opt_not_impl ~fail:not_impl guard
+                (eval_case binds body)
+                acc)
+            init earlier_rev)
   | _ -> raise (Not_implemented annot)
 
 let eval_annot subst term =

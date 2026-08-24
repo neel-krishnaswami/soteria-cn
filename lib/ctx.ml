@@ -58,6 +58,8 @@ let run_with_prog (prog : Usable_mucore.file) f =
   let pred_defs = Hashtbl.create 64 in
   add_pred_defs prog pred_defs;
   add_umu_defs prog tag_defs;
+  Soteria_c_helpers.Adt.register_datatypes prog.datatypes
+    ~cases:(fun (d : Usable_mucore.datatype) -> d.cases);
   try f () with
   | effect Get_prog, k -> Effect.Deep.continue k prog
   | effect Get_pred_def name, k -> continue k (Hashtbl.find pred_defs name)

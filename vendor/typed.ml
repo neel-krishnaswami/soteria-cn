@@ -1,5 +1,5 @@
 (* Vendored from soteria-tools/soteria soteria-c/lib (mainline 4e9182b; ctree_block/state_variants/csymex/symbol_std/layout from cn-main-merge 7b89176). *)
-include Soteria.Bv_values.Typed.Make (Soteria.Bv_values.Svalue.Dummy_ext) ()
+include Soteria.Bv_values.Typed.Make_transparent (Adt_ext) ()
 
 let ptr_bits =
   Option.get Cerb_frontend.Ocaml_implementation.DefaultImpl.impl.sizeof_pointer
@@ -80,3 +80,24 @@ module Syntax = struct
     end
   end
 end
+
+(* ───────────────────────── ADT extension glue ───────────────────────── *)
+
+module T_adt = struct
+  type sadt = [ `Adt ]
+end
+
+let t_adt name : [> T_adt.sadt ] ty =
+  Soteria.Bv_values.Svalue.TExtension (Adt_ext.TAdt name)
+
+let mk_adt ty x : 'a t = Adt_ext.mk (fun k t -> Svalue.(k <| t)) ty x
+
+let adt_constr ~adt ~con (args : Svalue.t list) : [> T_adt.sadt ] t =
+  mk_adt (t_adt adt) (Adt_ext.Constr { adt; con; args })
+
+let adt_tester ~con (v : [> T_adt.sadt ] t) : T.sbool t =
+  mk_adt Soteria.Bv_values.Svalue.TBool (Adt_ext.Tester { con; v })
+
+let adt_sel ~adt ~con ~field ~(field_ty : 'b ty) (v : [> T_adt.sadt ] t) : 'b t
+    =
+  mk_adt field_ty (Adt_ext.Sel { adt; con; field; v })

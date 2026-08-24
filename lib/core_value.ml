@@ -28,6 +28,7 @@ type t =
   | Tuple of t list
   | Record of (Id.t * t) list
   | Bool of T.sbool Typed.t
+  | Adt of Typed.T_adt.sadt Typed.t
 
 (* A specified value prints as [Spec(...)] and an unspecified one as [Unspec],
    so that a [Loaded] value stays distinguishable from a raw [Obj]. *)
@@ -58,6 +59,7 @@ let rec pp ft (v : t) =
       let pp_field ft (id, v) = Fmt.pf ft "%a: %a" Fmt_ail.pp_id id pp v in
       Fmt.pf ft "@[<hov 2>{%a}@]" Fmt.(list ~sep:semi pp_field) fields
   | Bool b -> Typed.ppa ft b
+  | Adt v -> Typed.ppa ft v
 
 let show = Fmt.to_to_string pp
 let true_ = Bool Typed.v_true
@@ -163,6 +165,11 @@ let rec nondet_bt (bt : Cn.BaseTypes.t) : t Csymex.t =
           fields
       in
       Record members
+  | Datatype sym ->
+      let+ v =
+        Csymex.nondet (Typed.t_adt (Soteria_c_helpers.Adt.adt_name sym))
+      in
+      Adt v
   | Struct sym ->
       let prog = Ctx.get_prog () in
       let layout =
@@ -245,7 +252,7 @@ let to_agv (v : t) : Aggregate_val.t =
   match v with
   | Obj o -> obj_to_agv o
   | Loaded o -> loaded_to_agv o
-  | Type _ | Unit | List _ | Tuple _ | Bool _ | Record _ ->
+  | Type _ | Unit | List _ | Tuple _ | Bool _ | Record _ | Adt _ ->
       L.failwith "Core_value.to_agv: not an aggregate value: %a" pp v
 
 (* The runtime type of a [Basic] aggregate value tells us which scalar [obj] it
@@ -314,6 +321,9 @@ let cast_ptr (v : t) : T.sptr Typed.t option =
 
 let cast_bool (v : t) : T.sbool Typed.t option =
   match v with Bool b -> Some b | _ -> None
+
+let cast_adt (v : t) : Typed.T_adt.sadt Typed.t option =
+  match v with Adt a -> Some a | _ -> None
 
 let c_int (i : int) : t =
   Obj (Int (Typed.BitVec.mk_masked Typed.c_int_bits (Z.of_int i)))
@@ -424,6 +434,7 @@ let rec sem_eq v1 v2 =
   | List l1, List l2 -> sem_eq_list l1 l2
   | Tuple t1, Tuple t2 -> sem_eq_list t1 t2
   | Bool b1, Bool b2 -> b1 ==@ b2
+  | Adt a1, Adt a2 -> a1 ==@ a2
   | _ -> Typed.v_false
 
 module Syntax = struct
@@ -469,6 +480,7 @@ module Syn = struct
     | List vs | Tuple vs -> List.iter (fun v -> iter_vars v f) vs
     | Record fields -> List.iter (fun (_, v) -> iter_vars v f) fields
     | Bool b -> Typed.Svalue.iter_vars (Typed.Expr.of_value b) f
+    | Adt v -> Typed.Svalue.iter_vars (Typed.Expr.of_value v) f
     | Type _ | Unit -> ()
 end
 
