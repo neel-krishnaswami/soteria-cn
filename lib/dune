@@ -3,7 +3,7 @@
  (libraries
   cn
   soteria
-  soteria-c
+  soteria_c_vendor
   cerberus-lib.frontend
   cerberus-lib.backend_common)
  (flags :standard -w +27)

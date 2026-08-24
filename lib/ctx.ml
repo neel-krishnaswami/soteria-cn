@@ -1,4 +1,4 @@
-open Soteria_c_lib
+open Soteria_c_vendor
 open Soteria.Logs.Import
 
 type _ Effect.t +=
@@ -9,7 +9,7 @@ let get_prog () = Effect.perform Get_prog
 let get_pred_def name = Effect.perform (Get_pred_def name)
 
 let cn_to_ctype_def (def : Usable_mucore.tag_definition) :
-    Soteria_c_lib.Layout.Tag_defs.def =
+    Soteria_c_vendor.Layout.Tag_defs.def =
   let module CF = Cerb_frontend in
   (* CN does not keep track of the source location of tag definitions. *)
   let loc = Cerb_location.unknown in
@@ -41,7 +41,7 @@ let cn_to_ctype_def (def : Usable_mucore.tag_definition) :
 (** TODO: optimise hash function for Symbol_std. *)
 
 let add_umu_defs (umu : Usable_mucore.file) tbl : unit =
-  let open Soteria_c_lib.Layout.Tag_defs in
+  let open Soteria_c_vendor.Layout.Tag_defs in
   Symbol_std.Map.fold
     (fun id def _ -> Hashtbl.add tbl id (cn_to_ctype_def def))
     umu.tag_defs ()

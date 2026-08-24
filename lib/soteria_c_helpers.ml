@@ -1,4 +1,4 @@
-open Soteria_c_lib
+open Soteria_c_vendor
 
 let not_impl desc =
   let open Csymex.Syntax in

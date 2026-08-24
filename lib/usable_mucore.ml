@@ -1,7 +1,7 @@
 (** A sane, OCaml-idiomatic re-implementation of CN's [Cn.Mucore] AST. *)
 
 module CF = Cerb_frontend
-module Sym = Soteria_c_lib.Symbol_std
+module Sym = Soteria_c_vendor.Symbol_std
 (* = Cerb_frontend.Symbol.sym, with Map/Set/pp *)
 
 module Locations = Cn.Locations

@@ -81,13 +81,13 @@ end
 (* Helper for all main entry points *)
 let initialise ?soteria_config mode config f =
   Option.iter Soteria.Config.set_and_lock soteria_config;
-  let@ () = Soteria_c_lib.Config.with_config ~config ~mode in
+  let@ () = Soteria_c_vendor.Config.with_config ~config ~mode in
   Soteria.Stats.As_ctx.with_dumped () f
 
 (* Parse [file] down to the (Usable) Mucore AST and pretty-print it, without
    running any symbolic execution. *)
 let show_mucore config c_config file =
-  let open Soteria_c_lib in
+  let open Soteria_c_vendor in
   let open Syntaxes.Result in
   let* file = Option.to_result ~none:"No input file provided" file in
   let@ () = initialise ~soteria_config:config Whole_program c_config in
@@ -117,7 +117,7 @@ let verify (config : Soteria.Config.t) c_config fuel functions file =
 
 let exec_main (config : Soteria.Config.t) c_config fuel file =
   let module SState = State in
-  let open Soteria_c_lib in
+  let open Soteria_c_vendor in
   let open Syntaxes.Result in
   let* file = Option.to_result ~none:"No input file provided" file in
   let fuel = Soteria.Symex.Fuel_gauge.Cli.validate_or_exit fuel in

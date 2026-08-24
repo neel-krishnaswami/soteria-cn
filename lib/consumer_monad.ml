@@ -1,6 +1,6 @@
 open Soteria.Soteria_std
-module Sym = Soteria_c_lib.Symbol_std
-module Csymex = Soteria_c_lib.Csymex
+module Sym = Soteria_c_vendor.Symbol_std
+module Csymex = Soteria_c_vendor.Csymex
 module Result = State.SM.Result
 
 module C = struct

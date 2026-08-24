@@ -1,0 +1,422 @@
+(* Vendored from soteria-tools/soteria soteria-c/lib (mainline 4e9182b; ctree_block/state_variants/csymex/symbol_std/layout from cn-main-merge 7b89176). *)
+module CF = Cerb_frontend
+open CF.Ctype
+open Typed.Syntax
+module BV = Typed.BitVec
+module Agv = Aggregate_val
+
+type bv_info = { bv_size : int; signed : bool }
+type member_kind = Padding of int | Field of Identifier.t
+
+type layout = {
+  size : int;
+  align : int;
+  members_ofs : (member_kind * int) list;
+}
+
+module Tag_defs = struct
+  type def = Cerb_location.t * Cerb_frontend.Ctype.tag_definition
+
+  type _ Effect.t +=
+    | Find_tag : CF.Symbol.sym -> def option Effect.t
+    | Find_layout_cache : CF.Ctype.ctype -> layout option Effect.t
+    | Add_layout_cache : CF.Ctype.ctype * layout -> unit Effect.t
+
+  let find_opt id tbl =
+    match Hashtbl.find_opt tbl id with
+    | Some x -> Some x
+    | None ->
+        [%l.debug "Cannot find definition for %a" Fmt_ail.pp_sym id];
+        None
+
+  let add_defs defs tbl =
+    List.iter (fun (id, (loc, _, def)) -> Hashtbl.add tbl id (loc, def)) defs
+
+  let get_or_compute_cached_layout id f =
+    match Effect.perform (Find_layout_cache id) with
+    | Some layout -> Some layout
+    | None ->
+        let open Syntaxes.Option in
+        let* layout = f () in
+        Effect.perform (Add_layout_cache (id, layout));
+        Some layout
+
+  let run_with_prog (sigma : Ail_tys.sigma) f =
+    let open Effect.Deep in
+    let tag_defs = Hashtbl.create 1020 in
+    let layouts = Hashtbl.create 1020 in
+    add_defs sigma.tag_definitions tag_defs;
+    try f () with
+    | effect Find_tag id, k -> continue k (find_opt id tag_defs)
+    | effect Find_layout_cache ty, k -> continue k (Hashtbl.find_opt layouts ty)
+    | effect Add_layout_cache (ty, l), k ->
+        continue k (Hashtbl.replace layouts ty l)
+
+  let find_opt id = Effect.perform (Find_tag id)
+end
+
+let is_int (Ctype (_, ty)) = [%matches? Basic (Integer _)] ty
+
+let precision (RealFloating f) : Svalue.FloatPrecision.t =
+  match f with Float -> F32 | Double -> F64 | LongDouble -> F128
+
+let normalise_int_ty int_ty =
+  Cerb_frontend.Ocaml_implementation.(normalise_integerType DefaultImpl.impl)
+    int_ty
+
+let size_of_int_ty (int_ty : integerType) =
+  (* DefaultImpl has a size for everything *)
+  CF.Ocaml_implementation.DefaultImpl.impl.sizeof_ity (normalise_int_ty int_ty)
+
+let align_of_int_ty (int_ty : integerType) =
+  CF.Ocaml_implementation.DefaultImpl.impl.alignof_ity (normalise_int_ty int_ty)
+
+let size_of_float_ty (fty : floatingType) =
+  CF.Ocaml_implementation.DefaultImpl.impl.sizeof_fty fty
+
+let align_of_float_ty (fty : floatingType) =
+  CF.Ocaml_implementation.DefaultImpl.impl.alignof_fty fty
+
+let size_of_int_ty_unsupported (int_ty : integerType) =
+  Csymex.of_opt_not_impl
+    ~msg:"size_of_int_ty_unsupported: integer of unknown size"
+  @@ size_of_int_ty int_ty
+
+let get_array_info ty =
+  match CF.Ctype.proj_ctype_ ty with
+  | Array (elem_ty, sz) -> Some (elem_ty, sz)
+  | _ -> None
+
+let get_struct_fields tag =
+  let open Syntaxes.Option in
+  let* _loc, def = Tag_defs.find_opt tag in
+  match def with
+  | StructDef (fs, fam) -> Some (fs, fam)
+  | UnionDef _ -> L.failwith "Not a structure"
+
+let get_struct_fields_ty ty =
+  match CF.Ctype.proj_ctype_ ty with
+  | Struct tag -> get_struct_fields tag
+  | _ -> L.failwith "Not a structure"
+
+let rec layout_of ty =
+  let open Syntaxes.Option in
+  (* Get cache, if not found, compute and update cache. *)
+  Tag_defs.get_or_compute_cached_layout ty @@ fun () ->
+  let (Ctype (_, ty)) = ty in
+  match ty with
+  | Basic (Integer inty) ->
+      let* size = size_of_int_ty inty in
+      let+ align = align_of_int_ty inty in
+      { size; align; members_ofs = [] }
+  | Basic (Floating fty) ->
+      let* size = size_of_float_ty fty in
+      let+ align = align_of_float_ty fty in
+      { size; align; members_ofs = [] }
+  | Pointer _ -> layout_of (Ctype ([], Basic (Integer Size_t)))
+  | Byte -> layout_of (Ctype ([], Basic (Integer (Unsigned Ichar))))
+  | Struct tag -> layout_of_struct tag
+  | Union tag ->
+      let* _loc, def = Tag_defs.find_opt tag in
+      let* members =
+        match def with
+        | UnionDef members -> Some members
+        | StructDef _ ->
+            [%l.debug "Don't have definition of union"];
+            None
+      in
+      union_layout_of_members members
+  | Array (elem_ty, Some sz) ->
+      let* elem_layout = layout_of elem_ty in
+      let size = elem_layout.size * Z.to_int sz in
+      let align = elem_layout.align in
+      Some { size; align; members_ofs = [] }
+  | _ ->
+      [%l.debug "Cannot compute layout of %a" Fmt_ail.pp_ty_ ty];
+      None
+
+and union_layout_of_members members =
+  (* Note that members will not contain end-padding, because it contains depends
+     on the variant.. *)
+  let open Syntaxes.Option in
+  let+ size, align, members_ofs =
+    List.fold_left
+      (fun acc (id, (_attrs, align, _quals, ty)) ->
+        let* acc_size, acc_align, members_ofs = acc in
+        let* l = layout_of ty in
+        let+ align =
+          match align with
+          | None -> Some l.align
+          | Some (AlignInteger z) -> Some (Z.to_int z)
+          | Some (AlignType ty) ->
+              let+ ty_l = layout_of ty in
+              ty_l.align
+        in
+        let members_ofs = (Field id, 0) :: members_ofs in
+        (max acc_size l.size, max acc_align align, members_ofs))
+      (Some (0, 0, []))
+      members
+  in
+  let size =
+    let m = size mod align in
+    if m = 0 then size else size + align - m
+  in
+
+  { align; size; members_ofs }
+
+and layout_of_struct tag =
+  let open Syntaxes.Option in
+  let* _loc, def = Tag_defs.find_opt tag in
+  let* members, flexible_array_member =
+    match def with
+    | StructDef (m, fam) -> Some (m, fam)
+    | _ ->
+        [%l.debug "Don't have a definition of structure"];
+        None
+  in
+  let* () =
+    (* TODO: flexible array members *)
+    if Option.is_some flexible_array_member then None else Some ()
+  in
+  struct_layout_of_members members
+
+(** From:
+    https://www.gnu.org/software/c-intro-and-ref/manual/html_node/Structure-Layout.html
+    The structure’s fields appear in the structure layout in the order they are
+    declared. When possible, consecutive fields occupy consecutive bytes within
+    the structure. However, if a field’s type demands more alignment than it
+    would get that way, C gives it the alignment it requires by leaving a gap
+    after the previous field.
+
+    Once all the fields have been laid out, it is possible to determine the
+    structure’s alignment and size. The structure’s alignment is the maximum
+    alignment of any of the fields in it. Then the structure’s size is rounded
+    up to a multiple of its alignment. That may require leaving a gap at the end
+    of the structure. *)
+and struct_layout_of_members members =
+  let open Syntaxes.Option in
+  let+ { size = size_before_padding; align; members_ofs = rev_members_ofs } =
+    Monad.OptionM.fold_list members
+      ~init:{ size = 0; align = 1; members_ofs = [] }
+      ~f:(fun
+          { size; align; members_ofs }
+          (field_name, (_attrs, _align, _quals, ty))
+        ->
+        let+ { size = field_size; align = field_align; _ } = layout_of ty in
+        let padding_size = size mod field_align in
+        let members_ofs =
+          (* Add padding if any *)
+          if padding_size > 0 then (Padding padding_size, size) :: members_ofs
+          else members_ofs
+        in
+        let mem_ofs = size + padding_size in
+        {
+          size = mem_ofs + field_size;
+          align = Int.max field_align align;
+          members_ofs = (Field field_name, mem_ofs) :: members_ofs;
+        })
+  in
+  let end_padding = size_before_padding mod align in
+  if end_padding > 0 then
+    {
+      members_ofs =
+        List.rev ((Padding end_padding, size_before_padding) :: rev_members_ofs);
+      size = size_before_padding + align - end_padding;
+      align;
+    }
+  else
+    {
+      members_ofs = List.rev rev_members_ofs;
+      size = size_before_padding;
+      align;
+    }
+
+let size_of_s ty =
+  match layout_of ty with
+  | Some { size; _ } -> Csymex.return (BV.usizeinz size)
+  | None ->
+      Fmt.kstr Csymex.not_impl "Cannot yet compute size of type %a"
+        Fmt_ail.pp_ty ty
+
+let align_of_s ty =
+  match layout_of ty with
+  | Some { align; _ } -> Csymex.return (BV.usizei align)
+  | None ->
+      Fmt.kstr Csymex.not_impl "Canot yet compute alignment of type %a"
+        Fmt_ail.pp_ty ty
+
+let member_ofs id ty =
+  match layout_of ty with
+  | Some { members_ofs; _ } -> (
+      let res =
+        List.find_opt
+          (function
+            | Field id', _ -> CF.Symbol.idEqual id id' | Padding _, _ -> false)
+          members_ofs
+      in
+      match res with
+      | Some (_, ofs) -> Csymex.return (BV.usizei ofs)
+      | None ->
+          Fmt.kstr Csymex.not_impl "Cannot find member %a in type %a"
+            Fmt_ail.pp_id id Fmt_ail.pp_ty ty)
+  | None ->
+      Fmt.kstr Csymex.not_impl "Cannot yet compute layout of type %a"
+        Fmt_ail.pp_ty ty
+
+let is_int_ty_signed (int_ty : integerType) =
+  let int_ty = normalise_int_ty int_ty in
+  match int_ty with
+  | Signed _ -> true
+  | Char | Bool | Unsigned _ -> false
+  | _ ->
+      [%l.debug "Cannot determine signedness of %a" Fmt_ail.pp_int_ty int_ty];
+      false
+
+let int_bv_info (int_ty : integerType) =
+  let open Syntaxes.Option in
+  let int_ty = normalise_int_ty int_ty in
+  let+ size = size_of_int_ty int_ty in
+  let signed = is_int_ty_signed int_ty in
+  { bv_size = size * 8; signed }
+
+let bv_info (ty : ctype) =
+  match proj_ctype_ ty with Basic (Integer ity) -> int_bv_info ity | _ -> None
+
+let int_constraints (int_ty : integerType) =
+  let open Typed.Infix in
+  let int_ty = normalise_int_ty int_ty in
+  match int_ty with
+  | Bool -> Some (fun x -> [ U8.(0s) <=@ x; (x <@ U8.(2s)) ])
+  | Char | Signed _ | Unsigned _ -> Some (fun _ -> [])
+  | _ ->
+      [%l.debug "No int constraints for %a" Fmt_ail.pp_int_ty int_ty];
+      None
+
+exception Unsupported of string
+
+let constraints_exn ~(ty : ctype) (v : Agv.t) : Typed.T.sbool Typed.t list =
+  let open Typed.Infix in
+  let unsupported msg = raise (Unsupported msg) in
+
+  let basic_or_unsupported v =
+    match v with
+    | Agv.Basic v -> v
+    | Agv.Struct _ | Agv.Array _ ->
+        Fmt.kstr unsupported "Not a basic value (%a) for type %a" Agv.pp v
+          Fmt_ail.pp_ty ty
+  in
+  match proj_ctype_ ty with
+  | Void -> (
+      let v = basic_or_unsupported v in
+      match Typed.cast_int v with
+      | None -> [ Typed.v_false ]
+      | Some (v, size) -> [ v ==@ BV.zero size ])
+  | Pointer _ -> [] (* Pointers should already have their invariants hold *)
+  | Basic (Integer ity) -> (
+      match int_constraints ity with
+      | None -> unsupported "No int constraints"
+      | Some constrs -> (
+          let v = basic_or_unsupported v in
+          match Typed.cast_int v with
+          | None -> [ Typed.v_false ]
+          | Some (x, _) -> constrs x))
+  | Basic (Floating _) ->
+      (* Floating constraints are already included in the floating type itself
+         (bitvectors) *)
+      []
+  | _ ->
+      Fmt.kstr unsupported "No constraints implemented for type %a"
+        Fmt_ail.pp_ty ty
+
+let constraints ~ty v =
+  try Some (constraints_exn ~ty v)
+  with Unsupported msg ->
+    [%l.debug "Constraints for %a: %s" Fmt_ail.pp_ty ty msg];
+    None
+
+let rec nondet_c_ty_ (ty : ctype_) : Typed.T.cval Typed.t Csymex.t =
+  let open Csymex.Syntax in
+  match ty with
+  | Void -> Csymex.return Usize.(0s)
+  | Byte -> nondet_c_ty_ (Basic (Integer (Unsigned Ichar)))
+  | Pointer _ ->
+      let* loc = Csymex.nondet Typed.t_loc in
+      let* ofs = Csymex.nondet Typed.t_usize in
+      Csymex.return (Typed.Ptr.mk loc ofs)
+  | Basic (Integer ity) ->
+      let* size = size_of_int_ty_unsupported ity in
+      let* res = Csymex.nondet (Typed.t_int (8 * size)) in
+      let constrs = int_constraints ity |> Option.get in
+      let+ () = Csymex.assume (constrs res) in
+      (res :> Typed.T.cval Typed.t)
+  | Basic (Floating fty) ->
+      let precision = precision fty in
+      let* res = Csymex.nondet (Typed.t_float precision) in
+      Csymex.return (res :> Typed.T.cval Typed.t)
+  | Array _ | Function _ | FunctionNoParams _ | Struct _ | Union _ | Atomic _ ->
+      Csymex.not_impl "nondet_c_ty: unsupported type"
+
+let nondet_c_ty (ty : ctype) : Typed.T.cval Typed.t Csymex.t =
+  nondet_c_ty_ (proj_ctype_ ty)
+
+let nondet_c_ty_aggregate_ (ty : ctype_) : Agv.t Csymex.t =
+  let open Csymex.Syntax in
+  let+ res = nondet_c_ty_ ty in
+  Agv.Basic res
+
+let nondet_c_ty_aggregate (ty : ctype) : Agv.t Csymex.t =
+  nondet_c_ty_aggregate_ (proj_ctype_ ty)
+
+let int_ty_bounds int_ty =
+  let open Syntaxes.Option in
+  match int_ty with
+  | Char -> Some (Z.zero, Z.of_int 255)
+  | Bool -> Some (Z.zero, Z.one)
+  | Signed _ ->
+      let+ size = size_of_int_ty int_ty in
+      let min = Z.neg (Z.shift_left Z.one ((size * 8) - 1)) in
+      let max = Z.pred (Z.shift_left Z.one ((size * 8) - 1)) in
+      (min, max)
+  | Unsigned _ ->
+      let+ size = size_of_int_ty int_ty in
+      let max = Z.pred (Z.shift_left Z.one (size * 8)) in
+      (Z.zero, max)
+  | _ -> None
+
+(** Returns the target type for "usual arithmetic conversions" between two
+    types.
+
+    See
+    https://learn.microsoft.com/en-us/cpp/c-language/usual-arithmetic-conversions
+*)
+let type_conversion_arith (ty1 : ctype) ty2 =
+  match (proj_ctype_ ty1, proj_ctype_ ty2) with
+  | Basic (Floating (RealFloating LongDouble)), _ -> ty1
+  | _, Basic (Floating (RealFloating LongDouble)) -> ty2
+  | Basic (Floating (RealFloating Double)), _ -> ty1
+  | _, Basic (Floating (RealFloating Double)) -> ty2
+  | Basic (Floating (RealFloating Float)), _ -> ty1
+  | _, Basic (Floating (RealFloating Float)) -> ty2
+  | Basic (Integer it1), Basic (Integer it2) -> (
+      let it1 = normalise_int_ty it1 in
+      let it2 = normalise_int_ty it2 in
+      if it1 = it2 then ty1
+      else
+        let size1 = Option.get @@ size_of_int_ty it1 in
+        let size2 = Option.get @@ size_of_int_ty it2 in
+        if size1 >= size2 then ty1
+        else if size2 > size1 then ty2
+        else
+          match (is_int_ty_signed it1, is_int_ty_signed it2) with
+          | true, false -> ty1
+          | false, true -> ty2
+          | _ -> ty1)
+  | Pointer _, _ -> ty1
+  | _, Pointer _ -> ty1
+  | _ -> L.failwith "non-basic types in arith operation"
+
+(** Size of the [int] type in C. *)
+let c_int_size =
+  Option.get
+    (Cerb_frontend.Ocaml_implementation.DefaultImpl.impl.sizeof_ity
+       (Signed Int_))

@@ -20,7 +20,7 @@ module Exec_main = struct
     Term.(
       const Soteria_cn.Driver.exec_main
       $ Soteria.Config.cmdliner_term ()
-      $ Soteria_c_lib.Config.cmdliner_term ()
+      $ Soteria_c_vendor.Config.cmdliner_term ()
       $ Soteria.Symex.Fuel_gauge.Cli.term
           ~default:Soteria.Symex.Fuel_gauge.infinite ()
       $ file_arg)
@@ -49,7 +49,7 @@ module Verify = struct
     Term.(
       const Soteria_cn.Driver.verify
       $ Soteria.Config.cmdliner_term ()
-      $ Soteria_c_lib.Config.cmdliner_term ()
+      $ Soteria_c_vendor.Config.cmdliner_term ()
       $ Soteria.Symex.Fuel_gauge.Cli.term
           ~default:Soteria.Symex.Fuel_gauge.infinite ()
       $ functions_arg $ file_arg)
@@ -71,7 +71,7 @@ module Show_mucore = struct
     Term.(
       const Soteria_cn.Driver.show_mucore
       $ Soteria.Config.cmdliner_term ()
-      $ Soteria_c_lib.Config.cmdliner_term ()
+      $ Soteria_c_vendor.Config.cmdliner_term ()
       $ file_arg)
 
   let cmd =

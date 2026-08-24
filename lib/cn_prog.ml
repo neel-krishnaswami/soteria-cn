@@ -1,7 +1,7 @@
 module SState = State
 open Soteria.Soteria_std
 open Soteria.Logs.Import
-open Soteria_c_lib
+open Soteria_c_vendor
 module State = SState
 module Mu = Usable_mucore
 open Csymex

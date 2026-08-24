@@ -1,5 +1,5 @@
 module State_here = State
-open Soteria_c_lib
+open Soteria_c_vendor
 module State = State_here
 open Soteria.Soteria_std
 open Soteria.Logs.Import

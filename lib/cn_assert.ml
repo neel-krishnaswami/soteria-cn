@@ -1,15 +1,15 @@
 open Soteria.Soteria_std
 open Soteria.Logs.Import
 module Mu = Usable_mucore
-module Typed = Soteria_c_lib.Typed
-module Csymex = Soteria_c_lib.Csymex
-module Layout = Soteria_c_lib.Layout
+module Typed = Soteria_c_vendor.Typed
+module Csymex = Soteria_c_vendor.Csymex
+module Layout = Soteria_c_vendor.Layout
 open Csymex
 open Syntax
 open Soteria_c_helpers
 module Producer = Producer_monad
 module Consumer = Consumer_monad
-module Sym = Soteria_c_lib.Symbol_std
+module Sym = Soteria_c_vendor.Symbol_std
 
 type term = Cn.(BaseTypes.t Terms.term)
 type annot = Cn.(BaseTypes.t Terms.annot)

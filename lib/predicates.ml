@@ -66,7 +66,7 @@ module M (Symex : Symex.Base) = struct
             | _ -> acc)
           None (Iter.of_list st)
       in
-      let+ elem, rest = List.take_nth idx st in
+      let+ elem, rest = (try Some (List.take_nth_exn idx st) with Invalid_argument _ -> None) in
       (elem, to_opt rest)
 
     let rec sure_list_eq (l1 : V.t list) (l2 : V.t list) : bool Symex.t =

@@ -1,7 +1,7 @@
 open Soteria.Soteria_std
 open Syntaxes.FunctionWrap
 open Soteria.Logs.Import
-open Soteria_c_lib
+open Soteria_c_vendor
 open Csymex
 module Mu = Usable_mucore
 open Mu

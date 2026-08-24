@@ -1,0 +1,806 @@
+(* Vendored from soteria-tools/soteria (mainline 4e9182b + CN produce additions from cn-main-merge 7b89176). Compat header added. *)
+open Soteria
+module Base = Soteria.Sym_states.Base
+module State_monad = Soteria.Sym_states.State_monad
+module Abstr = Soteria.Data.Abstr
+open Logs.Import
+open Soteria_std
+
+(** A [Split_tree] is a simplified representation of a tree, that has no offset.
+    It however indicates, on [Node]s, at what offset the split occurs, relative
+    to that node's start. *)
+module Split_tree = struct
+  type ('a, 'sint) t =
+    | Leaf of 'a
+    | Node of ('a, 'sint) t * 'sint * ('a, 'sint) t
+  [@@deriving show]
+
+  let rec map f = function
+    | Leaf x -> Leaf (f x)
+    | Node (l, at, r) -> Node (map f l, at, map f r)
+end
+
+type node_qty = Partially | Totally [@@deriving show { with_path = false }]
+type 'a node = NotOwned of node_qty | Owned of 'a
+
+open Data.Range_tree
+
+type ('a, 'sint) tree = ('a node, 'sint) Data.Range_tree.t
+
+let build_tree = Data.Range_tree.build
+let build_tree_leaf = Data.Range_tree.build_leaf
+let make_tree_raw = Data.Range_tree.make_raw
+
+(** The input module of [Tree_block]. A memory value [t] represents an owned
+    part of the tree block, with the property that it can be split or merged as
+    needed.
+
+    The merge doesn't need to preserve all information. For instance consider
+    the memory values [Value | Uninit | PartlyUninit]; merging nodes [Value] and
+    [Uninit] may yield a [PartlyUninit] node, and that node will contain both
+    children, ensuring no information is lost.
+
+    Furthermore, to enable bi-abduction, a memory value can potentially be
+    serialized into one or more predicates (named [syn]). Consuming should
+    extract that predicate from the given tree; producing adds it onto it.
+
+    [syn] mustn't store information about the offset or length it applies to, as
+    [Tree_block] wraps it into a structure containing this information. *)
+module MemVal (Symex : Symex.Base) = struct
+  module Abstr = Data.Abstr.M (Symex)
+  module S_int = Data.S_int.S (Symex)
+
+  module type S = sig
+    (** @canonical Data.S_bool.S(Symex).S *)
+    module S_bool : Data.S_bool.S(Symex).S
+
+    module S_int : [%mixins S_int.Bounded_S + Abstr.S_with_syn]
+
+    type t
+    type sint := S_int.t
+
+    val pp : Format.formatter -> t -> unit
+
+    (** Merges two children node into a single node; returns the merged node.
+        Note children of the node are always preserved too, for further
+        accesses. *)
+    val merge : left:t -> right:t -> t
+
+    (** [split ~at node] Splits [node] at [at], which is the relative offset
+        within the node. Returns the left and right split trees, which
+        themselves may contain further splits.
+
+        [at] is guaranteed to be in the range [\[1, size(node))], i.e. strictly
+        within the node. *)
+    val split :
+      at:sint -> t -> ((t, sint) Split_tree.t * (t, sint) Split_tree.t) Symex.t
+
+    type syn
+
+    val ins_outs : syn -> Symex.Value.Expr.t list * Symex.Value.Expr.t list
+    val pp_syn : Format.formatter -> syn -> unit
+
+    (** Serialize this memory value; either returns [Some syn], or [None] to
+        signal the children must instead be serialized instead. *)
+    val to_syn : t -> syn Seq.t option
+
+    (** Extract the given [syn] predicate from the tree; this may result in an
+        empty ([NotOwned Totally]) tree, or may only modify part of the tree if
+        the predicate only represents part of this tree's state. A [Missing] may
+        be raised if part of the state is missing for the consumption to
+        succeed.
+
+        The input tree corresponds to the subtree relevant to the predicate's
+        offset and length, meaning [t.node] is the node covering the whole
+        predicate's range. *)
+    val consume :
+      syn -> (t, sint) tree -> ((t, sint) tree, syn list) Symex.Consumer.t
+
+    (** Add the given [syn] predicate onto the given tree; the input tree is not
+        necessarily empty ([NotOwned Totally]), and if the predicate overlaps
+        the production may [vanish].
+
+        The input tree corresponds to the subtree relevant to the predicate's
+        offset and length, meaning [t.node] is the node covering the whole
+        predicate's range. *)
+    val produce : syn -> (t, sint) tree -> (t, sint) tree Symex.Producer.t
+
+    (** Returns [ok] if this memory value is exclusively owned, ie no additional
+        state can be composed with it; in other words, calling [produce] on a
+        tree with this node must always vanish. Otherwise this should raise a
+        [miss] with the fixes needed for this to become exclusively owned. *)
+    val assert_exclusively_owned :
+      (t, sint) tree -> (unit, 'err, syn list) Symex.Result.t
+  end
+end
+
+module Make (Symex : Symex.Base) (MemVal : MemVal(Symex).S) = struct
+  module Expr = Symex.Value.Expr
+  open Compo_res
+  open Symex.Syntax
+  open Symex
+  open Data.S_bool.Make_syntax (Symex) (MemVal.S_bool)
+  open Data.S_int.Make_syntax (Symex) (MemVal.S_int)
+
+  type nonrec sint = MemVal.S_int.t
+
+  (* re-export the types to be able to use them easily *)
+  type nonrec ('a, 'sint) tree = ('a, 'sint) tree
+
+  module Range = Data.S_range.Make (Symex) (MemVal.S_bool) (MemVal.S_int)
+  module Split_tree = Split_tree
+
+  module Node = struct
+    type qty = node_qty = Partially | Totally
+
+    let pp_qty ft = function
+      | Partially -> Fmt.pf ft "Part."
+      | Totally -> Fmt.pf ft "Tot."
+
+    let merge_qty left right =
+      match (left, right) with Totally, Totally -> Totally | _, _ -> Partially
+
+    type t = MemVal.t node
+
+    let pp ft = function
+      | NotOwned qty -> Fmt.pf ft "NotOwned %a" pp_qty qty
+      | Owned v -> MemVal.pp ft v
+
+    let is_empty = [%matches? NotOwned Totally]
+    let is_fully_owned = [%matches? Owned _]
+
+    (* NOTE: is this the right level of abstraction? Should we not pass the tree
+       and instead just recurse through the leaves? *)
+    let assert_exclusively_owned = MemVal.assert_exclusively_owned
+
+    let merge ~left ~right =
+      match (left, right) with
+      | NotOwned Totally, NotOwned Totally -> (NotOwned Totally, false)
+      | NotOwned _, _ | _, NotOwned _ -> (NotOwned Partially, true)
+      | Owned left, Owned right ->
+          let v = MemVal.merge ~left ~right in
+          (Owned v, true)
+
+    let split ~at node =
+      match node with
+      | Owned v ->
+          let lift = Split_tree.map (fun v -> Owned v) in
+          let+ left, right = MemVal.split ~at v in
+          (lift left, lift right)
+      | NotOwned Totally ->
+          return
+            ( Split_tree.Leaf (NotOwned Totally),
+              Split_tree.Leaf (NotOwned Totally) )
+      | NotOwned Partially ->
+          L.failwith "Should never split an intermediate node"
+  end
+
+  module Tree = struct
+    type t = (MemVal.t, sint) tree
+
+    let pp : t Fmt.t = Data.Range_tree.pp Node.pp MemVal.S_int.pp
+    let node_merge l r = fst (Node.merge ~left:l ~right:r)
+
+    let make ~node ~range ?children () =
+      Data.Range_tree.make_raw ~node ~range ?children ()
+
+    let rebuild t = Data.Range_tree.rebuild ~merge:node_merge t
+    let is_empty t = Node.is_empty t.node
+    let not_owned range = make ~node:(NotOwned Totally) ~range ?children:None ()
+    let iter_leaves_rev = Data.Range_tree.iter_leaves_rev
+    let map_leaves f t = Data.Range_tree.map_leaves (module Symex.Result) f t
+
+    let of_children_s ~left ~right =
+      let range = (fst left.range, snd right.range) in
+      let node, keep_children = Node.merge ~left:left.node ~right:right.node in
+      let children = if keep_children then Some (left, right) else None in
+      return @@ make ~node ~range ?children ()
+
+    let of_children _ ~left ~right = of_children_s ~left ~right
+
+    (** Like {!of_children}, but doesn't attempt merging the children, i.e.
+        assumes that the intermediary node that is in [t] is still correct for
+        the new children. This is faster than {!of_children} but is only sound
+        if the children's content did not change. *)
+    let with_children t ~left ~right =
+      return (make ~node:t.node ~range:t.range ~children:(left, right) ())
+
+    let offset ~by t =
+      match MemVal.S_int.to_z by with
+      | Some z when Z.equal z Z.zero -> t
+      | _ -> Data.Range_tree.offset ~add:( +@ ) ~by t
+
+    (** Converts a [Split_tree] of [Node]s (ie. a tree with no base) into a
+        [Tree], reconstructing each node's range and constructing intermediary
+        nodes. *)
+    let rec of_split_tree range = function
+      | Split_tree.Leaf node -> return @@ make ~node ~range ()
+      | Node (left, at, right) ->
+          let left_span, right_span = Range.split_at range (fst range +@ at) in
+          let* left = of_split_tree left_span left in
+          let* right = of_split_tree right_span right in
+          of_children_s ~left ~right
+
+    (** Converts the given [Tree] into a [Split_tree], ignoring intermediary
+        nodes and erasing offset information. *)
+    let rec to_split_tree t : (Node.t, sint) Split_tree.t =
+      let low, _ = t.range in
+      let aux t : (Node.t, sint) Split_tree.t =
+        match t.children with
+        | None -> Leaf t.node
+        | Some (left, right) ->
+            let _, split = left.range in
+            Node (to_split_tree left, split -@ low, to_split_tree right)
+      in
+      aux t
+
+    (** [split_at t p] splits [t] at position [p]. Precondition: [p] is strictly
+        inside [t.range]. Returns the subtrees left and right of [p], which
+        together cover [t.range]. Only leaves are ever split: if [p] falls
+        strictly inside a subtree we recurse into it, so intermediate nodes are
+        preserved. *)
+    let rec split_at (t : t) p : (t * t) Symex.t =
+      match t.children with
+      | Some (left, right) ->
+          let _, mid = left.range in
+          if%sat p ==@ mid then return (left, right)
+          else if%sat p <@ mid then
+            let* ll, lr = split_at left p in
+            let+ right = of_children_s ~left:lr ~right in
+            (ll, right)
+          else
+            let* rl, rr = split_at right p in
+            let+ left = of_children_s ~left ~right:rl in
+            (left, rr)
+      | None ->
+          let* left_node, right_node =
+            Node.split ~at:(p -@ fst t.range) t.node
+          in
+          let left_span, right_span = Range.split_at t.range p in
+          let* left = of_split_tree left_span left_node in
+          let+ right = of_split_tree right_span right_node in
+          (left, right)
+
+    (** [split ~range t] isolates [range] from [t]. Precondition: [range] is a
+        strict subrange of [t.range] (neither empty nor equal to [t.range]).
+        Returns [(node, left, right)] where:
+        - [node] is the node covering exactly [range]
+        - [left] and [right] can be safely set as [t]'s children, and [range]
+          lies within either [left] or [right].
+
+        If [range] touches the left or right edge of [t], a single split
+        suffices. Otherwise we split at both ends of [range], making the
+        procedure right-biased (it prefers introducing structure on the right).
+    *)
+    let split ~range t : (Node.t * t * t) Symex.t =
+      let ol, oh = t.range in
+      let nl, nh = range in
+      if%sat ol ==@ nl then
+        let+ left, right = split_at t nh in
+        (left.node, left, right)
+      else if%sat oh ==@ nh then
+        let+ left, right = split_at t nl in
+        (right.node, left, right)
+      else
+        let* left, rest = split_at t nl in
+        let* mid, right = split_at rest nh in
+        let+ right = of_children_s ~left:mid ~right in
+        (mid.node, left, right)
+
+    let rec extract (t : t) (range : Range.t) : (t * t option) Symex.t =
+      (* First result is the extracted tree, second is the remain *)
+      if%sat Range.sem_eq range t.range then return (t, None)
+      else if Option.is_none t.children then return (t, None)
+      else
+        let left, right = Option.get t.children in
+        if%sat Range.subset_eq range left.range then
+          let* extracted, new_left = extract left range in
+          let+ new_self =
+            match new_left with
+            | Some left -> of_children_s ~right ~left
+            | None -> return right
+          in
+          (extracted, Some new_self)
+        else
+          let* extracted, new_right = extract right range in
+          let+ new_self =
+            match new_right with
+            | Some right -> of_children_s ~right ~left
+            | None -> return left
+          in
+          (extracted, Some new_self)
+
+    let extend_if_needed t range =
+      let rl, rh = range in
+      let sl, sh = t.range in
+      let* t_with_left =
+        if%sat rl <@ sl then
+          let new_left_tree =
+            make ~node:(NotOwned Totally) ~range:(rl, sl) ()
+          in
+          let children = (new_left_tree, t) in
+          let qty = if is_empty t then Node.Totally else Partially in
+          return (make ~node:(NotOwned qty) ~range:(rl, sh) ~children ())
+        else return t
+      in
+      let sl, _ = t_with_left.range in
+      let* result =
+        if%sat sh <@ rh then
+          let new_right_tree =
+            make ~node:(NotOwned Totally) ~range:(sh, rh) ()
+          in
+          let children = (t_with_left, new_right_tree) in
+          let qty = if is_empty t_with_left then Node.Totally else Partially in
+          return (make ~node:(NotOwned qty) ~range:(sl, rh) ~children ())
+        else return t_with_left
+      in
+      return result
+
+    let rec add_to_the_right t addition : t Symex.t =
+      match t.children with
+      | None -> of_children_s ~left:t ~right:addition
+      | Some (left, right) ->
+          let* new_right = add_to_the_right right addition in
+          of_children_s ~left ~right:new_right
+
+    let rec add_to_the_left t addition : t Symex.t =
+      match t.children with
+      | None -> of_children_s ~left:addition ~right:t
+      | Some (left, right) ->
+          let* new_left = add_to_the_left left addition in
+          of_children_s ~left:new_left ~right
+
+    module Frame_range (M : sig
+      type ('a, 'b, 'c) t
+
+      val return : 'a -> ('a, 'b, 'c) t
+      val lift : 'a Symex.t -> ('a, 'b, 'c) t
+      val bind : ('a -> ('d, 'b, 'c) t) -> ('a, 'b, 'c) t -> ('d, 'b, 'c) t
+      val map : ('a -> 'd) -> ('a, 'b, 'c) t -> ('d, 'b, 'c) t
+
+      module Syntax : sig
+        module Symex_syntax : sig
+          val branch_on :
+            ?left_branch_name:string ->
+            ?right_branch_name:string ->
+            Value.(sbool t) ->
+            then_:(unit -> ('a, 'b, 'c) t) ->
+            else_:(unit -> ('a, 'b, 'c) t) ->
+            ('a, 'b, 'c) t
+        end
+      end
+    end) =
+    struct
+      open M.Syntax
+
+      let ( let* ) x f = M.bind f x
+      let ( let+ ) x f = M.map f x
+      let ( let*^ ) x f = M.bind f (M.lift x)
+      let ( let+^ ) x f = M.map f (M.lift x)
+
+      (** [frame_range t ~replace_node ~rebuild_parent range] Extracts from [t]
+          the subtree that exactly spans [range]. The [range] must be non-empty.
+          If [t] does not already cover [range], it is first extended with
+          [NotOwned] nodes so that it does.
+
+          Once the target subtree is found, [replace_node] is applied to it and
+          must return the replacement subtree.
+
+          The path back to the root is then rebuilt by calling [rebuild_parent]
+          with the (possibly modified) children at each step. Use
+          [of_children_s] for [rebuild_parent] when the parent node needs to be
+          recomputed from its children. Use [with_children] when only the tree
+          structure changed (e.g. after a load) and no recomputation of the
+          parent’s semantic content is required. In doubt, [of_children_s] is
+          usually a safe bet.
+
+          [frame_range] returns a pair of the extracted subtree (before
+          modification with [replace_node]) and the new root of the whole tree.
+      *)
+      let frame_range (t : t) ~(replace_node : t -> (t, 'b, 'c) M.t)
+          ~rebuild_parent (range : Range.t) : (t * t, 'b, 'c) M.t =
+        let rec frame_inside ~(replace_node : t -> (t, 'b, 'c) M.t)
+            ~rebuild_parent (t : t) (range : Range.t) : (t * t, 'b, 'c) M.t =
+          if%sat Range.sem_eq range t.range then
+            let+ new_tree = replace_node t in
+            (t, new_tree)
+          else
+            match t.children with
+            | Some (left, right) ->
+                let _, mid = left.range in
+                if%sat Range.strictly_inside mid range then
+                  let l, h = range in
+                  let upper_range = (mid, h) in
+                  let dont_replace_node = M.return in
+                  if%sat
+                    (* High-range already good *)
+                    Range.sem_eq upper_range right.range
+                  then
+                    (* Rearrange left*)
+                    let lower_range = (l, mid) in
+                    let* _, left =
+                      frame_inside ~replace_node:dont_replace_node
+                        ~rebuild_parent:with_children left lower_range
+                    in
+                    let*^ extracted, left_opt = extract left lower_range in
+                    let*^ right = add_to_the_left right extracted in
+                    let*^ new_self =
+                      of_children_s ~left:(Option.get left_opt) ~right
+                    in
+                    frame_inside ~replace_node ~rebuild_parent new_self range
+                  else
+                    let* _, right =
+                      frame_inside ~replace_node:dont_replace_node
+                        ~rebuild_parent:with_children right upper_range
+                    in
+                    let*^ extracted, right_opt = extract right upper_range in
+                    let*^ left = add_to_the_right left extracted in
+                    let*^ new_self =
+                      of_children_s ~left ~right:(Option.get right_opt)
+                    in
+                    frame_inside ~replace_node ~rebuild_parent new_self range
+                else if%sat Range.subset_eq range left.range then
+                  let* node, left =
+                    frame_inside ~replace_node ~rebuild_parent left range
+                  in
+                  let+^ new_parent = rebuild_parent t ~left ~right in
+                  (node, new_parent)
+                else
+                  (* Range is necessarily inside of right *)
+                  let* node, right =
+                    frame_inside ~replace_node ~rebuild_parent right range
+                  in
+                  let+^ new_parent = rebuild_parent t ~left ~right in
+                  (node, new_parent)
+            | None ->
+                let*^ _, left, right = split ~range t in
+                let*^ new_self = with_children t ~left ~right in
+                frame_inside ~replace_node ~rebuild_parent new_self range
+        in
+        let*^ root = extend_if_needed t range in
+        let+ framed, new_root =
+          frame_inside ~replace_node ~rebuild_parent root range
+        in
+        (* We rebalance at the end.*)
+        (framed, rebuild new_root)
+    end
+
+    include Frame_range (struct
+      include Symex.Result
+
+      module Syntax = struct
+        module Symex_syntax = Symex.Syntax.Symex_syntax
+      end
+
+      let return = Symex.Result.ok
+      let lift x = Symex.map Compo_res.ok x
+    end)
+    (* Exposed helpers *)
+
+    let get_raw ofs size t =
+      let range = Range.of_low_and_size ofs size in
+      let replace_node node = Result.ok node in
+      let rebuild_parent = with_children in
+      frame_range t ~replace_node ~rebuild_parent range
+
+    let put_raw tree t =
+      let rebuild_parent = of_children in
+      let replace_node _ = Result.ok tree in
+      let++ _, new_tree =
+        frame_range t ~replace_node ~rebuild_parent tree.range
+      in
+      ((), new_tree)
+
+    (** Cons/prod *)
+
+    module Consumer_frame_range = Frame_range (struct
+      include Symex.Consumer
+
+      type ('a, 'b, 'c) t = ('a, 'c) Symex.Consumer.t
+
+      let return = ok
+    end)
+
+    let consume (syn : MemVal.syn) (range : Range.t) (st : t) :
+        (t, MemVal.syn list) Consumer.t =
+      let open Symex.Consumer.Syntax in
+      let replace_node t = MemVal.consume syn t in
+      let rebuild_parent = of_children in
+      let+ _, tree =
+        Consumer_frame_range.frame_range st ~replace_node ~rebuild_parent range
+      in
+      tree
+
+    module Producer_frame_range = Frame_range (struct
+      include Symex.Producer
+
+      type ('a, 'b, 'c) t = 'a Symex.Producer.t
+    end)
+
+    let produce (syn : MemVal.syn) (range : Range.t) (st : t) : t Producer.t =
+      let open Symex.Producer.Syntax in
+      let replace_node t = MemVal.produce syn t in
+      let rebuild_parent = of_children in
+      let+ _, tree =
+        Producer_frame_range.frame_range st ~replace_node ~rebuild_parent range
+      in
+      tree
+
+    module Symex_frame_range = Frame_range (struct
+      include Symex
+
+      type ('a, 'b, 'c) t = 'a Symex.t
+
+      let lift = Fun.id
+    end)
+
+    let produce' produce_inner range st : t Symex.t =
+      let open Symex.Syntax in
+      let replace_node t = produce_inner t in
+      let rebuild_parent = of_children in
+      let+ _, tree =
+        Symex_frame_range.frame_range st ~replace_node ~rebuild_parent range
+      in
+      tree
+  end
+
+  type t = {
+    root : Tree.t;
+    bound : sint option; [@printer Fmt.(option ~none:(any "⊥") MemVal.S_int.pp)]
+  }
+  [@@deriving show { with_path = false }]
+
+  module SM =
+    State_monad.Make
+      (Symex)
+      (struct
+        type nonrec t = t option
+      end)
+
+  let is_empty t = Option.is_none t.bound && Tree.is_empty t.root
+
+  let pp_pretty ft t =
+    let open PrintBox in
+    let r = ref [] in
+    let () =
+      Option.iter
+        (fun b ->
+          let range_str = Fmt.str "[%a; ∞[" MemVal.S_int.pp b in
+          r := [ (range_str, text "OOB") ])
+        t.bound
+    in
+    let () =
+      Tree.iter_leaves_rev t.root (fun leaf ->
+          let range_str = (Fmt.to_to_string Range.pp) leaf.range in
+          let node_str = Fmt.to_to_string Node.pp leaf.node |> text in
+          r := (range_str, node_str) :: !r)
+    in
+    PrintBox_text.pp ft (frame @@ record !r)
+
+  (** Logic *)
+
+  type syn =
+    | MemVal of {
+        offset : MemVal.S_int.syn;
+        len : MemVal.S_int.syn;
+        v : MemVal.syn;
+      }
+    | Bound of MemVal.S_int.syn
+        [@printer fun f v -> Fmt.pf f "Bound(%a)" MemVal.S_int.pp_syn v]
+  [@@deriving show { with_path = false }]
+
+  let ins_outs = function
+    | MemVal { offset; len; v } ->
+        let offset = MemVal.S_int.exprs_syn offset in
+        let len = MemVal.S_int.exprs_syn len in
+        let mis, mos = MemVal.ins_outs v in
+        (offset @ len @ mis, mos)
+    | Bound b -> ([], MemVal.S_int.exprs_syn b)
+
+  let lift_fixes ~offset ~len fixes =
+    let offset = MemVal.S_int.to_syn offset in
+    let len = MemVal.S_int.to_syn len in
+    List.map (fun fix -> MemVal { v = fix; offset; len }) fixes
+
+  let lift_miss ~offset ~len symex =
+    let+? fixes = symex in
+    lift_fixes ~offset ~len fixes
+
+  let lift_miss_c ~offset ~len consumer =
+    let open Symex.Consumer.Syntax in
+    let+? fixes = consumer in
+    lift_fixes ~offset ~len fixes
+
+  let of_opt ?mk_fixes x =
+    match (x, mk_fixes) with
+    | Some t, _ -> Result.ok t
+    | None, Some mk_fixes ->
+        let+ fixes = mk_fixes () in
+        Missing fixes
+    | None, None ->
+        Result.miss_no_fix ~reason:"Tree_block.of_opt missed with no fix" ()
+
+  let to_opt t = if is_empty t then None else Some t
+
+  (* Bit of a hack here, we lift the [StateT (Result)] to [ResultT (State)] by
+     propagating the input state to erroneous outcomes. *)
+  let with_bound_check ?mk_fixes (ofs : sint)
+      (f : Tree.t -> ('a * Tree.t, 'err, syn list) Symex.Result.t) :
+      ('a, 'err, syn list) SM.Result.t =
+   fun st ->
+    let+ res =
+      let** t = of_opt ?mk_fixes st in
+      let** () =
+        match t.bound with
+        | None -> Result.ok ()
+        | Some bound ->
+            if%sat bound <@ ofs then Result.error `OutOfBounds else Result.ok ()
+      in
+      let++ v, root = f t.root in
+      (v, to_opt { t with root })
+    in
+    match res with
+    | Ok (v, t) -> (Compo_res.Ok v, t)
+    | Error e -> (Error e, st)
+    | Missing f -> (Missing f, st)
+
+  let assert_exclusively_owned () =
+    let open SM in
+    let open Syntax in
+    let* t = get_state () in
+    match t with
+    | None | Some { bound = None; _ } ->
+        Result.miss_no_fix ~reason:"assert_exclusively_owned - no bound" ()
+    | Some { bound = Some bound; root = { range = low, high; _ } as root } ->
+        if%sat low ==@ 0s &&@ (high ==@ bound) then
+          lift
+          @@ lift_miss ~offset:0s ~len:bound
+          @@ Node.assert_exclusively_owned root
+        else
+          Result.miss_no_fix
+            ~reason:"assert_exclusively_owned - tree does not span [0; bound["
+            ()
+
+  let get_raw_tree_owned ofs size =
+    with_bound_check (ofs +@ size) (fun t ->
+        let** tree, t = Tree.get_raw ofs size t in
+        if Node.is_fully_owned tree.node then
+          let tree = Tree.offset ~by:(0s -@ ofs) tree in
+          Result.ok (tree, t)
+        else Result.miss_no_fix ~reason:"get_raw_tree_owned" ())
+
+  (* This is used for copy_nonoverapping. It is an action on the destination
+     block, and assumes the received tree is at offset 0 *)
+  let put_raw_tree ofs (tree : Tree.t) : (unit, 'err, syn list) SM.Result.t =
+    let size = Range.size tree.range in
+    with_bound_check (ofs +@ size) (fun t ->
+        let tree = Tree.offset ~by:ofs tree in
+        Tree.put_raw tree t)
+
+  let alloc v size =
+    { root = Tree.make ~node:(Owned v) ~range:(0s, size) (); bound = Some size }
+
+  (** Logic *)
+
+  let to_syn (t : t) : syn list =
+    let bound =
+      match t.bound with
+      | None -> Seq.empty
+      | Some bound -> Seq.return (Bound (MemVal.S_int.to_syn bound))
+    in
+    let rec serialize_tree (tree : Tree.t) =
+      match tree.node with
+      | NotOwned Totally -> Seq.empty
+      | Owned v -> (
+          let offset = fst tree.range in
+          let len = Range.size tree.range in
+          match MemVal.to_syn v with
+          | None ->
+              let left, right = Option.get tree.children in
+              Seq.append (serialize_tree left) (serialize_tree right)
+          | Some seq ->
+              let offset = MemVal.S_int.to_syn offset in
+              let len = MemVal.S_int.to_syn len in
+              Seq.map (fun v -> MemVal { offset; len; v }) seq)
+      | NotOwned Partially ->
+          let left, right = Option.get tree.children in
+          Seq.append (serialize_tree left) (serialize_tree right)
+    in
+    Seq.append (serialize_tree t.root) bound |> List.of_seq
+
+  let consume_bound bound t =
+    let open Consumer in
+    let open Syntax in
+    match t with
+    | None | Some { bound = None; _ } -> miss_no_fix ~reason:"consume_bound" ()
+    | Some { bound = Some v; root } ->
+        let+ () = MemVal.S_int.learn_eq bound v in
+        to_opt { bound = None; root }
+
+  let produce_bound (bound : MemVal.S_int.syn) (st : t option) :
+      t option Symex.Producer.t =
+    let open Producer in
+    let open Producer.Syntax in
+    let pb () =
+      let* bound = apply_subst MemVal.S_int.subst bound in
+      let+^ () = assume [ MemVal.S_int.is_in_bound bound ] in
+      bound
+    in
+    match st with
+    | None ->
+        let+ bound = pb () in
+        Some { bound = Some bound; root = Tree.not_owned (0s, bound) }
+    | Some { bound = None; root } ->
+        let* bound = pb () in
+        let+^ () = assume [ snd root.range <=@ bound ] in
+        Some { bound = Some bound; root }
+    | Some { bound = Some _; _ } -> vanish ()
+
+  let produce'
+      (produce_inner :
+        (MemVal.t, MemVal.S_int.t) tree ->
+        (MemVal.t, MemVal.S_int.t) tree Symex.t)
+      (range : MemVal.S_int.t * MemVal.S_int.t) (t : t option) :
+      t option Symex.t =
+    let low, high = range in
+    let* () = assume MemVal.S_int.[ is_in_bound low; is_in_bound high ] in
+    let t =
+      match t with
+      | Some t -> t
+      | None -> { bound = None; root = Tree.not_owned range }
+    in
+    let* () =
+      match t.bound with
+      | None -> Symex.return ()
+      | Some bound -> assume [ high <=@ bound ]
+    in
+    let+ root = Tree.produce' produce_inner range t.root in
+    to_opt { t with root }
+
+  (* Lots of repetition happening here... *)
+  let produce_mem_val (offset : MemVal.S_int.syn) (len : MemVal.S_int.syn)
+      (v : MemVal.syn) (t : t option) : t option Producer.t =
+    let open Producer in
+    let open Producer.Syntax in
+    let* offset = apply_subst MemVal.S_int.subst offset in
+    let* len = apply_subst MemVal.S_int.subst len in
+    let ((low, high) as range) = Range.of_low_and_size offset len in
+    let*^ () = assume MemVal.S_int.[ is_in_bound low; is_in_bound high ] in
+    let t =
+      match t with
+      | Some t -> t
+      | None -> { bound = None; root = Tree.not_owned range }
+    in
+    let*^ () =
+      match t.bound with
+      | None -> Symex.return ()
+      | Some bound -> assume [ high <=@ bound ]
+    in
+    let+ root = Tree.produce v range t.root in
+    to_opt { t with root }
+
+  let consume_mem_val (offset : MemVal.S_int.syn) (len : MemVal.S_int.syn) v t =
+    let open Consumer in
+    let open Consumer.Syntax in
+    let* offset = apply_subst MemVal.S_int.subst offset in
+    let* len = apply_subst MemVal.S_int.subst len in
+    let ((_, high) as range) = Range.of_low_and_size offset len in
+    let* t = lift_res @@ of_opt t in
+    let* () =
+      match t.bound with
+      | None -> ok ()
+      | Some bound -> assert_pure (high <=@ bound)
+    in
+    let+ root = lift_miss_c ~offset ~len @@ Tree.consume v range t.root in
+    to_opt { t with root }
+
+  let consume (syn : syn) (t : t option) =
+    match syn with
+    | Bound bound -> consume_bound bound t
+    | MemVal { offset; len; v } -> consume_mem_val offset len v t
+
+  let produce (ser : syn) : t option -> t option Symex.Producer.t =
+    match ser with
+    | Bound bound -> produce_bound bound
+    | MemVal { offset; len; v } -> produce_mem_val offset len v
+end

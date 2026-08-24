@@ -1,5 +1,5 @@
 module SState = State
-open Soteria_c_lib
+open Soteria_c_vendor
 module State = SState
 open Soteria.Soteria_std
 open Soteria.Logs.Import
@@ -56,7 +56,7 @@ let eval_impl_call (i : CF.Implementation.implementation_constant)
   match (i, args) with _ -> not_impl "unsupported impl call"
 
 let malloc_failure_case () =
-  if (Soteria_c_lib.Config.current ()).alloc_cannot_fail then []
+  if (Soteria_c_vendor.Config.current ()).alloc_cannot_fail then []
   else
     [
       (fun () ->

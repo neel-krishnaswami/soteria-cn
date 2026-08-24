@@ -1,4 +1,4 @@
-open Soteria_c_lib
+open Soteria_c_vendor
 open Soteria.Soteria_std
 open Soteria.Logs.Import
 open Syntaxes.FunctionWrap
@@ -9,7 +9,7 @@ open Mu
 module Predicates = Predicates.M (Csymex)
 
 module SState = struct
-  include Soteria_c_lib.State_variants.Lazy
+  include Soteria_c_vendor.State_variants.Lazy
 
   let consume_owned ptr ty : (Core_value.t, _, _) SM.Result.t =
     let open SM.Syntax in
@@ -42,7 +42,7 @@ module SState = struct
   let leaks (state : t option) : Cerb_location.t option list =
     let result =
       match state with
-      | None | Some Soteria_c_lib.State.{ heap = None; _ } -> []
+      | None | Some { heap = None; _ } -> []
       | Some { heap = Some heap; _ } ->
           Seq.filter_map
             (fun (_, (block : Block.t)) ->

@@ -1,0 +1,82 @@
+(* Vendored from soteria-tools/soteria (mainline 4e9182b + CN produce additions from cn-main-merge 7b89176). Compat header added. *)
+open Soteria
+module Base = Soteria.Sym_states.Base
+module State_monad = Soteria.Sym_states.State_monad
+module Abstr = Soteria.Data.Abstr
+open Soteria_std
+
+module Make
+    (Symex : Symex.Base)
+    (Info : sig
+      type t
+
+      val pp : t Fmt.t
+    end)
+    (B : Base.M(Symex).S) =
+struct
+  (* TODO: this could probably all be generated using a deriver, instead of
+     having a module in the library *)
+
+  type ('a, 'info) with_info = { node : 'a; info : 'info option }
+  [@@deriving show { with_path = false }]
+
+  type t = (B.t, Info.t) with_info [@@deriving show { with_path = false }]
+
+  let pp' ?(inner = B.pp) ?(info = Info.pp) ft t = pp_with_info inner info ft t
+  let pp ft t = pp' ft t
+
+  module SM =
+    State_monad.Make
+      (Symex)
+      (struct
+        type nonrec t = t option
+      end)
+
+  open SM.Syntax
+
+  type syn = (B.syn, Info.t) with_info [@@deriving show { with_path = false }]
+
+  let ins_outs (s : syn) = B.ins_outs s.node
+
+  let to_syn (t : t) : syn list =
+    B.to_syn t.node |> List.map (fun node -> { node; info = t.info })
+
+  let lower = function
+    | None -> (None, None)
+    | Some { node; info } -> (Some node, info)
+
+  let lift ~info = function None -> None | Some node -> Some { node; info }
+
+  let wrap (f : ('a, 'err, B.syn list) B.SM.Result.t) :
+      ('a, 'err, syn list) SM.Result.t =
+    let* t = SM.get_state () in
+    let node, info = lower t in
+    let*^ res, node' = f node in
+    let+ () = SM.set_state (lift ~info node') in
+    Compo_res.map_missing (List.map (fun fix -> { node = fix; info })) res
+
+  let consume (syn : syn) (st : t option) :
+      (t option, syn list) Symex.Consumer.t =
+    let open Symex.Consumer.Syntax in
+    let node_opt, info = lower st in
+    let+ node_opt' =
+      let+? fix = B.consume syn.node node_opt in
+      List.map (fun fix -> { node = fix; info }) fix
+    in
+    lift ~info node_opt'
+
+  let produce' ?info (prod_inner : B.t option -> B.t option Symex.t)
+      (st : t option) : t option Symex.t =
+    let open Symex.Syntax in
+    let t_opt, t_orig = lower st in
+    let info = Option.merge (fun a _ -> a) t_orig info in
+    let+ node_opt = prod_inner t_opt in
+    lift ~info node_opt
+
+  let produce syn st : t option Symex.Producer.t =
+    let open Symex.Producer.Syntax in
+    let t_opt, t_orig = lower st in
+    let info = Option.merge (fun a _ -> a) t_orig syn.info in
+    let+ node = B.produce syn.node t_opt in
+    lift ~info node
+end

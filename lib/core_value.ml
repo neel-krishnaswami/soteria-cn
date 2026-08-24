@@ -1,4 +1,4 @@
-open Soteria_c_lib
+open Soteria_c_vendor
 open Soteria.Logs.Import
 open Soteria.Soteria_std
 open Typed

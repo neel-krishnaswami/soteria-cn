@@ -1,5 +1,5 @@
 module SState = State
-open Soteria_c_lib
+open Soteria_c_vendor
 open Soteria.Soteria_std
 open Soteria.Logs.Import
 open Core_value.Syntax
