@@ -101,3 +101,6 @@ let adt_tester ~con (v : [> T_adt.sadt ] t) : T.sbool t =
 let adt_sel ~adt ~con ~field ~(field_ty : 'b ty) (v : [> T_adt.sadt ] t) : 'b t
     =
   mk_adt field_ty (Adt_ext.Sel { adt; con; field; v })
+
+let fn_app ~fn ~(ret_ty : 'a ty) (args : Svalue.t list) : 'a t =
+  mk_adt ret_ty (Adt_ext.App { fn; args })

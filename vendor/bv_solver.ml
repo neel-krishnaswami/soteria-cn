@@ -1,0 +1,604 @@
+(* Vendored from soteria-tools/soteria soteria/lib/bv_values/bv_solver.ml
+   (mainline 4e9182b). Compat header added; the Analysis functor additionally
+   passes extension-bearing constraints through to the solver state (see
+   [Cn note] below) instead of letting the equality analysis absorb them. *)
+module Symex = Soteria.Symex
+module Solvers = Soteria.Solvers
+module Soteria_std = Soteria.Soteria_std
+module Logs = Soteria.Logs
+open Soteria_std
+open Logs.Import
+open Svalue
+module Var = Svalue.Var
+
+(* Copied from soteria/lib/bv_values/typed_intf.ml ([Solver_value]), which is
+   not exported from the library: the exact slice of [Typed.S] the solver
+   consumes, so width-overriding Typeds (like ours) can still be passed. *)
+module type Solver_value = sig
+  module Ext : Svalue.Value_ext
+  module Svalue : module type of Svalue.Make (Ext) ()
+  module Eval : module type of Eval.Make (Ext) (Svalue)
+
+  module T : sig
+    type sint = [ `NonZero | `Zero ]
+    type sbool = [ `Bool ]
+  end
+
+  include Symex.Value.S with type sbool = T.sbool
+
+  open T
+
+  val t_int : int -> [> sint ] ty
+  val untype_type : 'a ty -> Svalue.ty
+  val iter_vars : 'a t -> (Var.t * 'b ty -> unit) -> unit
+  val type_ : Svalue.t -> 'a t
+  val untyped : 'a t -> Svalue.t
+  val equal : 'a t -> 'a t -> bool
+  val sem_eq : 'a t -> 'b t -> sbool t
+  val v_true : [> sbool ] t
+  val v_false : [> sbool ] t
+  val and_ : [< sbool ] t -> [< sbool ] t -> [> sbool ] t
+  val split_ands : [< sbool ] t -> ([> sbool ] t -> unit) -> unit
+
+  module BitVec : sig
+    val mk : int -> Z.t -> [> sint ] t
+  end
+
+  module Infix : sig
+    val ( ==@ ) : 'a t -> 'a t -> [> sbool ] t
+    val ( <=@ ) : [< sint ] t -> [< sint ] t -> [> sbool ] t
+    val ( &&@ ) : [< sbool ] t -> [< sbool ] t -> [> sbool ] t
+  end
+end
+
+(** Returns [Some true] if PC slot [pc] implies query [q], [Some false] if [pc]
+    implies the negation of [q], and [None] otherwise. Used to suppress
+    redundant ordering constraints (e.g. [a <= b] becomes trivially true once
+    [a < b] is in the PC). *)
+let[@inline] implies_or_contradicts ~(q : _ Svalue.t) ~(neg_q : _ Svalue.t)
+    (pc : _ Svalue.t) : bool option =
+  let open Svalue in
+  if Svalue.equal q pc then Some true
+  else if Svalue.equal neg_q pc then Some false
+  else
+    match (q.node.kind, pc.node.kind) with
+    (* [a < b] in PC implies [a <= b] *)
+    | Binop (Leq qs, qa, qb), Binop (Lt ps, pa, pb)
+      when qs = ps && equal qa pa && equal qb pb ->
+        Some true
+    (* [a < b] in PC implies ~[b <= a] and ~[b < a] *)
+    | Binop ((Lt qs | Leq qs), qa, qb), Binop (Lt ps, pa, pb)
+      when qs = ps && equal qa pb && equal qb pa ->
+        Some false
+    (* [a <= b] in PC implies ~[b < a] *)
+    | Binop (Lt qs, qa, qb), Binop (Leq ps, pa, pb)
+      when qs = ps && equal qa pb && equal qb pa ->
+        Some false
+    (* [a < b] (either direction) in PC implies ~[a = b] *)
+    | Binop (Eq, qa, qb), Binop (Lt _, pa, pb)
+      when (equal qa pa && equal qb pb) || (equal qa pb && equal qb pa) ->
+        Some false
+    (* [a < b] (either direction) in PC implies [~(a = b)] *)
+    | ( Unop (Not, { node = { kind = Binop (Eq, qa, qb); _ }; _ }),
+        Binop (Lt _, pa, pb) )
+      when (equal qa pa && equal qb pb) || (equal qa pb && equal qb pa) ->
+        Some true
+    | _ -> None
+
+module Make_incremental
+    (Typed : Solver_value)
+    (Analysis : Analyses.Make(Typed).S)
+    (Intf :
+      Solvers.Solver_interface.S
+        with type value = Typed.Svalue.t
+         and type ty = Typed.Svalue.ty) =
+struct
+  module Svalue = Typed.Svalue
+  module Value = Typed
+
+  let rec simplify ~trivial_truthiness ~fallback (v : Svalue.t) =
+    let simplify = simplify ~trivial_truthiness ~fallback in
+    match v.node.kind with
+    | Bool _ | BitVec _ | Float _ -> v
+    | _ -> (
+        match trivial_truthiness (Typed.type_ v) with
+        | Some true -> Svalue.Bool.v_true
+        | Some false -> Svalue.Bool.v_false
+        | None -> (
+            match v.node.kind with
+            | Unop (Not, e) ->
+                let e' = simplify e in
+                if Svalue.equal e e' then fallback v else Svalue.Bool.not e'
+            | Binop (Eq, e1, e2) ->
+                if Svalue.equal e1 e2 then Svalue.Bool.v_true
+                else if Svalue.sure_neq e1 e2 then Svalue.Bool.v_false
+                else fallback v
+            | Binop (And, e1, e2) ->
+                let se1 = simplify e1 in
+                let se2 = simplify e2 in
+                if Svalue.equal se1 e1 && Svalue.equal se2 e2 then v
+                else Svalue.Bool.and_ se1 se2
+            | Binop (Or, e1, e2) ->
+                let se1 = simplify e1 in
+                let se2 = simplify e2 in
+                if Svalue.equal se1 e1 && Svalue.equal se2 e2 then fallback v
+                else Svalue.Bool.or_ se1 se2
+            | Ite (g, e1, e2) ->
+                let sg = simplify g in
+                let se1 = simplify e1 in
+                let se2 = simplify e2 in
+                if
+                  Svalue.equal sg g
+                  && Svalue.equal se1 e1
+                  && Svalue.equal se2 e2
+                then v
+                else Svalue.Bool.ite sg se1 se2
+            | _ -> fallback v))
+
+  module Var_counter = Var.Incr_counter_mut (struct
+    let start_at = 0
+  end)
+
+  module Solver_state = struct
+    include Reversible.Make_mutable_array (struct
+      type t = Typed.(sbool t)
+    end)
+
+    let add_constraint t v =
+      if Typed.equal v Typed.v_true then ()
+      else (
+        if Typed.equal v Typed.v_false then truncate_to_checkpoint t;
+        add t v)
+
+    (** This function returns [Some b] if the solver state is trivially [b]
+        (true or false). We maintain solver state such that trivial truths are
+        never added to the state, and false is false erases everything else.
+        Therefore, it is enough to check either for emptyness of the topmost
+        layer or falseness of the latest element. *)
+    let trivial_truthiness t =
+      if is_at_checkpoint t then Some true
+      else if Typed.equal (peek_last t) Typed.v_false then Some false
+      else None
+
+    let trivial_truthiness_of t v =
+      let neg_v = Typed.not v in
+      let q = Typed.untyped v in
+      let neg_q = Typed.untyped neg_v in
+      find_map t (fun value ->
+          implies_or_contradicts ~q ~neg_q (Typed.untyped value))
+  end
+
+  type t = {
+    z3_exe : Intf.t;
+    save_counter : Save_counter.t;
+    var_counter : Var_counter.t;
+    state : Solver_state.t;
+    analysis : Analysis.t;
+  }
+  [@@deriving reversible]
+
+  let init () =
+    let s = init () in
+    Intf.push s.z3_exe 1;
+    s
+
+  let reset s =
+    reset s;
+    Intf.push s.z3_exe 1
+
+  let fresh_var solver ty =
+    let v_id = Var_counter.get_next solver.var_counter in
+    Intf.declare_var solver.z3_exe v_id (Typed.untype_type ty);
+    v_id
+
+  let simplify solver (v : 'a Typed.t) : 'a Typed.t =
+    v
+    |> Typed.untyped
+    |> simplify
+         ~trivial_truthiness:(Solver_state.trivial_truthiness_of solver.state)
+         ~fallback:(Analysis.simplify solver.analysis)
+    |> Typed.type_
+
+  let add_constraints solver ?(simplified = false) vs =
+    let iter = vs |> Iter.of_list |> Iter.flat_map Typed.split_ands in
+    iter @@ fun v ->
+    let v = if simplified then v else simplify solver v in
+    (* the incremental solver doesn't need to dirty variables *)
+    let v, _ = Analysis.add_constraint solver.analysis (Typed.untyped v) in
+    Solver_state.add_constraint solver.state (Typed.type_ v);
+    Intf.add_constraint solver.z3_exe v
+
+  (* Incremental doesn't allow for caching queries... *)
+  let sat solver =
+    match Solver_state.trivial_truthiness solver.state with
+    | Some true -> Symex.Solver_result.Sat
+    | Some false -> Unsat
+    | None -> (
+        let answer = Intf.check_sat solver.z3_exe in
+        match answer with
+        | Sat -> Sat
+        | Unsat -> Unsat
+        | Unknown ->
+            [%l.info "Solver returned unknown"];
+            Unknown)
+
+  let as_values_iter solver =
+    Iter.append
+      (Solver_state.iter solver.state)
+      (Analysis.encode solver.analysis)
+
+  let pp (ft : Format.formatter) (solver : t) : unit =
+    (Fmt.Dump.iter (Fun.flip as_values_iter) Fmt.nop Typed.ppa) ft solver
+
+  let as_exprs solver =
+    as_values_iter solver |> Iter.map Typed.Expr.of_value |> Iter.to_list
+end
+
+module Make
+    (Typed : Solver_value)
+    (Analysis : Analyses.Make(Typed).S)
+    (Intf :
+      Solvers.Solver_interface.S
+        with type value = Typed.Svalue.t
+         and type ty = Typed.Svalue.ty) =
+struct
+  module Svalue = Typed.Svalue
+  module Eval = Typed.Eval
+
+  let rec simplify ~trivial_truthiness ~fallback (v : Svalue.t) =
+    let simplify = simplify ~trivial_truthiness ~fallback in
+    match v.node.kind with
+    | Bool _ | BitVec _ | Float _ -> v
+    | _ -> (
+        match trivial_truthiness (Typed.type_ v) with
+        | Some true -> Svalue.Bool.v_true
+        | Some false -> Svalue.Bool.v_false
+        | None -> (
+            match v.node.kind with
+            | Unop (Not, e) ->
+                let e' = simplify e in
+                if Svalue.equal e e' then fallback v else Svalue.Bool.not e'
+            | Binop (Eq, e1, e2) ->
+                if Svalue.equal e1 e2 then Svalue.Bool.v_true
+                else if Svalue.sure_neq e1 e2 then Svalue.Bool.v_false
+                else fallback v
+            | Binop (And, e1, e2) ->
+                let se1 = simplify e1 in
+                let se2 = simplify e2 in
+                if Svalue.equal se1 e1 && Svalue.equal se2 e2 then v
+                else Svalue.Bool.and_ se1 se2
+            | Binop (Or, e1, e2) ->
+                let se1 = simplify e1 in
+                let se2 = simplify e2 in
+                if Svalue.equal se1 e1 && Svalue.equal se2 e2 then fallback v
+                else Svalue.Bool.or_ se1 se2
+            | Ite (g, e1, e2) ->
+                let sg = simplify g in
+                let se1 = simplify e1 in
+                let se2 = simplify e2 in
+                if
+                  Svalue.equal sg g
+                  && Svalue.equal se1 e1
+                  && Svalue.equal se2 e2
+                then v
+                else Svalue.Bool.ite sg se1 se2
+            | _ -> fallback v))
+
+  module Value = Typed
+
+  module Var_counter = Var.Incr_counter_mut (struct
+    let start_at = 1
+  end)
+
+  module Solver_state = struct
+    (** Inside a slot, we either have an assertion, or a marker indicating that
+        all assertions relating to a variable may need to be rechecked -- for
+        instance because an auxiliary analysis has new information about it that
+        is not directly in the PC. *)
+    type slot_content =
+      | Asrt of Typed.sbool Typed.t [@printer Typed.ppa]
+      | Dirty of Var.Set.t [@printer Fmt.(iter ~sep:comma) Var.Set.iter Var.pp]
+    [@@deriving show]
+
+    (** Each slot holds a symbolic boolean, as well a boolean indicating if it
+        was checked to be satisfiable. The boolean is mutable and can be mutated
+        even by future branches! If a branch downstream is satisfiable, then so
+        is any element on the path condition. *)
+    type slot = { value : slot_content; mutable checked : bool }
+    [@@deriving show]
+
+    (* Invariants: the PC only has checked things, and then only unchecked
+       things. *)
+
+    include Reversible.Make_mutable_array (struct
+      type t = slot
+    end)
+
+    let add_constraint arr v =
+      if Typed.equal v Typed.v_true then ()
+      else (
+        if Typed.equal v Typed.v_false then truncate_to_checkpoint arr;
+        add arr { value = Asrt v; checked = false })
+
+    let dirty_variable (t : t) v = add t { value = Dirty v; checked = false }
+
+    (** This function returns [Some b] if the solver state is trivially [b]
+        (true or false). We maintain solver state such that trivial truths are
+        never added to the state, and false is false erases everything else.
+        Therefore, it is enough to check either for emptyness of the topmost
+        layer or falseness of the latest element. *)
+    let trivial_truthiness (t : t) =
+      match to_seq_rev t () with
+      | Nil -> Some true (* The empty constraint is satisfiable *)
+      | Cons ({ checked = true; _ }, _) ->
+          Some true (* All constraints have been checked to be sat *)
+      | Cons ({ value = Asrt value; _ }, _) when Typed.(equal value v_false) ->
+          Some false
+      | _ -> None
+
+    let trivial_truthiness_of (t : t) (v : Typed.sbool Typed.t) =
+      let neg_v = Typed.not v in
+      let q = Typed.untyped v in
+      let neg_q = Typed.untyped neg_v in
+      find_map t @@ function
+      | { value = Asrt value; _ } ->
+          implies_or_contradicts ~q ~neg_q (Typed.untyped value)
+      | _ -> None
+
+    (** Iterate over the assertions in the PC. *)
+    let iter (t : t) =
+      iter t
+      |> Iter.filter_map @@ function
+         | { value = Asrt value; _ } -> Some value
+         | { value = Dirty _; _ } -> None
+
+    (** If we have checked sat and obtaied SAT, we can mark all elements of the
+        list as checked! *)
+    let mark_checked (t : t) =
+      let rec aux seq =
+        match seq () with
+        | Seq.Cons (({ checked = false; _ } as slot), rest) ->
+            (* If we see something unchecked we mark as checked and continue *)
+            slot.checked <- true;
+            aux rest
+        | _ ->
+            (* Otherwise we stop *)
+            ()
+      in
+      aux (to_seq_rev t)
+
+    (** We aggregate the unchecked constraints. We start from the right and
+        collect all constraints marked as unchecked. We also aggregate all
+        variables contained by the unchecked assertions, and fetch, All
+        assertions (even checked) that also contain these variables. In the end,
+        we need to fetch the closure from these variables.
+
+        The function returns the list to encode, as well the set of all
+        variables required. *)
+    let unchecked_constraints t =
+      let changed = ref false in
+      let var_set = Var.Hashset.with_capacity 8 in
+      let vars value = Value.iter_vars value |> Iter.map fst in
+      let to_encode = Dynarray.create () in
+      let add_vars_raw vars = Var.Hashset.add_iter var_set vars in
+      let add_vars vars =
+        vars @@ fun v -> changed := Var.Hashset.add_check var_set v || !changed
+      in
+      let relevant = Iter.exists (Var.Hashset.mem var_set) in
+      (* We need to reach some kind of fixpoint *)
+      let rec aux_checked others seq =
+        match seq () with
+        | Seq.Nil ->
+            if !changed then (
+              changed := false;
+              aux_checked Seq.empty others)
+            else ()
+        | Seq.Cons (({ value = Asrt value; _ } as slot), rest) ->
+            let vars = vars value in
+            if relevant vars then (
+              add_vars vars;
+              Dynarray.add_last to_encode value;
+              aux_checked others rest)
+            else
+              let others = fun () -> Seq.Cons (slot, others) in
+              aux_checked others rest
+        | Seq.Cons ({ value = Dirty vars; _ }, rest) ->
+            let vars = Fun.flip Var.Set.iter vars in
+            if relevant vars then
+              (* Variables that are together in a Dirty slot might indicate a
+                 relationship between the variables. We need to consider them
+                 connected. *)
+              add_vars vars;
+            aux_checked others rest
+      in
+      let rec aux seq =
+        match seq () with
+        | Seq.Nil -> ()
+        | Cons ({ value = Asrt value; checked = false }, rest) ->
+            Dynarray.add_last to_encode value;
+            add_vars_raw (vars value);
+            aux rest
+        | Cons ({ value = Dirty vars; checked = false }, rest) ->
+            add_vars_raw (fun f -> Var.Set.iter f vars);
+            aux rest
+        | Cons ({ checked = true; _ }, _) -> aux_checked Seq.empty seq
+      in
+      let () = aux (to_seq_rev t) in
+      (to_encode, var_set)
+  end
+
+  type t = {
+    z3_exe : Intf.t; [@reversible.ignore]
+    vars : Var_counter.t;
+    save_counter : Save_counter.t;
+    state : Solver_state.t;
+    analysis : Analysis.t;
+  }
+  [@@deriving reversible]
+
+  let fresh_var solver _ = Var_counter.get_next solver.vars
+
+  let simplify solver v : 'a Typed.t =
+    v
+    |> Typed.untyped
+    |> simplify
+         ~trivial_truthiness:(Solver_state.trivial_truthiness_of solver.state)
+         ~fallback:(Analysis.simplify solver.analysis)
+    |> Typed.type_
+
+  let add_constraints solver ?(simplified = false) vs =
+    let iter = vs |> Iter.of_list |> Iter.flat_map Typed.split_ands in
+    iter @@ fun v ->
+    let v = if simplified then v else simplify solver v in
+    let v, vars = Analysis.add_constraint solver.analysis (Typed.untyped v) in
+    Solver_state.add_constraint solver.state (Typed.type_ v);
+    if not (Var.Set.is_empty vars) then
+      Solver_state.dirty_variable solver.state vars
+
+  let memo_sat_check_tbl : Symex.Solver_result.t Svalue.Hashtbl.t =
+    Svalue.Hashtbl.create 1023
+
+  let trivial_model_works solver to_check var_tys =
+    let exception No_model in
+    let value_generator : Svalue.ty -> unit -> Svalue.t = function
+      | TLoc n ->
+          let max = Z.(shift_left one n) in
+          fun () -> Svalue.Ptr.loc_of_z n (Z.random_int max)
+      | TBitVector n ->
+          let max = Z.(shift_left one n) in
+          fun () -> Svalue.BitVec.mk n (Z.random_int max)
+      | TBool -> fun () -> Svalue.Bool.of_bool (Random.bool ())
+      (* TODO: because we can't evaluate floats, we can never do a trivial check
+         for them. *)
+      | TFloat _ -> raise_notrace No_model
+      (* TODO: figure this out *)
+      | TPointer _ | TSeq _ | TExtension _ -> raise_notrace No_model
+    in
+    let fuel = 3 in
+    try
+      let bindings =
+        Var.Map.fold
+          (fun v (ty : Svalue.ty) acc ->
+            let values =
+              Iter.forever (value_generator ty)
+              |> Analysis.filter solver.analysis v ty
+              |> Iter.take fuel
+              |> Iter.to_array
+            in
+            if Array.length values = 0 then raise_notrace No_model;
+            Var.Map.add v values acc)
+          var_tys Var.Map.empty
+      in
+      let rec aux i =
+        let rec eval_var _ v _ =
+          let values = Var.Map.find v bindings in
+          let index = i mod Array.length values in
+          match values.(index) with
+          | { node = { kind = Var var; ty }; _ } as v -> eval_var v var ty
+          | v -> v
+        in
+        let res = Eval.eval ~eval_var to_check in
+        if Svalue.equal res Svalue.Bool.v_true then true
+        else if i >= fuel then false
+        else aux (i + 1)
+      in
+      aux 0
+    with No_model -> false
+
+  let check_sat_raw solver to_check =
+    (* TODO: we shouldn't wait for ack for each command individually... *)
+    let var_tys =
+      Svalue.iter_vars to_check
+      |> Iter.fold (fun acc (v, ty) -> Var.Map.add v ty acc) Var.Map.empty
+    in
+    if trivial_model_works solver to_check var_tys then Symex.Solver_result.Sat
+    else (
+      (* We need to reset the state, so we can push the new constraints *)
+      Intf.reset solver.z3_exe;
+      (* Declare all relevant variables *)
+      Var.Map.iter (Intf.declare_var solver.z3_exe) var_tys;
+      (* Declare the constraint *)
+      Intf.add_constraint solver.z3_exe to_check;
+      (* Actually check sat *)
+      Intf.check_sat solver.z3_exe)
+
+  let check_sat_raw_memo solver to_check =
+    let to_check = Typed.untyped to_check in
+    match Svalue.Hashtbl.find_opt memo_sat_check_tbl to_check with
+    | Some result -> result
+    | None ->
+        let result = check_sat_raw solver to_check in
+        Svalue.Hashtbl.add memo_sat_check_tbl to_check result;
+        result
+
+  let sat solver =
+    match Solver_state.trivial_truthiness solver.state with
+    | Some true -> Symex.Solver_result.Sat
+    | Some false -> Unsat
+    | None ->
+        let to_check, relevant_vars =
+          Solver_state.unchecked_constraints solver.state
+        in
+        (* This will put the check in a somewhat-normal form, to increase cache
+           hits. *)
+        let to_check = Dynarray.fold_left Typed.and_ Typed.v_true to_check in
+        let to_check =
+          Iter.fold Typed.and_ to_check
+            (Analysis.encode ~vars:relevant_vars solver.analysis)
+        in
+        let answer = check_sat_raw_memo solver to_check in
+        if answer = Sat then Solver_state.mark_checked solver.state;
+        answer
+
+  let as_values_iter solver =
+    Iter.append
+      (Solver_state.iter solver.state)
+      (Analysis.encode solver.analysis)
+
+  let pp fmt solver =
+    (Fmt.Dump.iter (Fun.flip as_values_iter) Fmt.nop Typed.ppa) fmt solver
+
+  let as_exprs solver =
+    as_values_iter solver |> Iter.map Typed.Expr.of_value |> Iter.to_list
+end
+
+module Analysis (Typed : Solver_value) = struct
+  open Analyses.Make (Typed)
+  include Merge (Interval) (Equality)
+
+  (* [Cn note] Constraints mentioning extension nodes (uninterpreted
+     applications, ADT constructors, ...) must reach the SMT solver verbatim:
+     the equality analysis absorbs [a == b] into its union-find and replays it
+     only by VARIABLE relevance, so a ground equation over extension terms
+     (e.g. an [unfold]'s [f(C) == body]) would otherwise never be sent. *)
+  let base_add_constraint = add_constraint
+
+  let has_extension sv =
+    let visited = Stdlib.Hashtbl.create 16 in
+    let rec go sv =
+      let tag = sv.Hc.tag in
+      if Stdlib.Hashtbl.mem visited tag then false
+      else (
+        Stdlib.Hashtbl.add visited tag ();
+        match sv.Hc.node.kind with
+        | Extension _ -> true
+        | Var _ | Bool _ | Float _ | BitVec _ -> false
+        | Ptr (a, b) | Binop (_, a, b) -> go a || go b
+        | Seq l | Nop (_, l) -> List.exists go l
+        | Unop (_, a) | Exists (_, a) -> go a
+        | Ite (a, b, c) -> go a || go b || go c)
+    in
+    go sv
+
+  let add_constraint t v =
+    if has_extension v then (v, Var.Set.empty) else base_add_constraint t v
+end
+
+module Z3 (Typed : Solver_value) =
+  Solvers.Z3.Make (Encoding.Make (Typed))
+
+module Z3_incremental_solver (Typed : Solver_value) =
+  Make_incremental (Typed) (Analysis (Typed)) (Z3 (Typed))
+
+module Z3_solver (Typed : Solver_value) =
+  Make (Typed) (Analysis (Typed)) (Z3 (Typed))

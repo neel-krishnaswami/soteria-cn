@@ -138,16 +138,42 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
   | Binop (op, t1, t2) -> (
       let v1 = eval_annot subst t1 in
       let v2 = eval_annot subst t2 in
+      (* FIXME(signedness): this should come from the operand types
+         ([Bits (Unsigned, _)] -> false), but the C-side interpreter
+         ([Minterp.eval_op]) currently compares signed unconditionally; using
+         the correct signedness here makes spec obligations and body path
+         conditions disagree on unsigned programs (e.g. min3.c). Keep the two
+         sides consistent until Minterp threads C types through comparisons. *)
+      let signed = true in
+      let ints () =
+        ( Core_value.cast_int v1 |> of_opt_not_impl,
+          Core_value.cast_int v2 |> of_opt_not_impl )
+      in
+      let int_op f =
+        let i1, i2 = ints () in
+        Core_value.Obj (Int (Typed.cast (f i1 i2)))
+      in
       match op with
-      | LE -> Core_value.leq ~signed:true v1 v2
+      | LE -> Core_value.leq ~signed v1 v2
+      | LT -> Core_value.lt ~signed v1 v2
       | And -> Core_value.Bool.and_ v1 v2
+      | Or -> Core_value.Bool.or_ v1 v2
+      | Implies -> Core_value.Bool.or_ (Core_value.Bool.not v1) v2
       | EQ ->
           [%l.trace "Sem_eq? %a == %a" Core_value.pp v1 Core_value.pp v2];
           Bool (Core_value.sem_eq v1 v2)
-      | Add ->
-          let v1 = Core_value.cast_int v1 |> of_opt_not_impl in
-          let v2 = Core_value.cast_int v2 |> of_opt_not_impl in
-          Obj (Int (v1 +!@ v2))
+      | Add -> int_op (fun a b -> a +!@ b)
+      | Sub -> int_op (fun a b -> Typed.BitVec.sub a b)
+      | Mul -> int_op (fun a b -> Typed.BitVec.mul a b)
+      | Div -> int_op (fun a b -> Typed.BitVec.div ~signed a (Typed.cast b))
+      | Rem -> int_op (fun a b -> Typed.BitVec.rem ~signed a (Typed.cast b))
+      | Mod -> int_op (fun a b -> Typed.BitVec.mod_ a b)
+      | Min ->
+          let i1, i2 = ints () in
+          Obj (Int (Typed.ite (Typed.BitVec.lt ~signed i1 i2) i1 i2))
+      | Max ->
+          let i1, i2 = ints () in
+          Obj (Int (Typed.ite (Typed.BitVec.lt ~signed i1 i2) i2 i1))
       | _ ->
           [%l.trace "Not impl binop?"];
           not_impl ())
@@ -155,6 +181,10 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
       let v = eval_annot subst t' in
       match op with
       | Not -> Core_value.Bool.not v
+      | Negate ->
+          let i = Core_value.cast_int v |> of_opt_not_impl in
+          let zero = Typed.BitVec.zero (Typed.size_of_int i) in
+          Obj (Int (Typed.cast (Typed.BitVec.sub zero i)))
       | _ ->
           [%l.trace "Not impl unop?"];
           not_impl ())
@@ -185,6 +215,31 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
       let p1 = eval_annot subst p1 in
       let p1 = Core_value.cast_ptr p1 |> of_opt_not_impl in
       Bool (Typed.Ptr.is_null p1)
+  | Apply (fsym, arg_annots) -> (
+      match Ctx.get_fun_def fsym with
+      | Some ({ body = Def _; _ } as def) ->
+          (* Capture-avoiding IT-level inlining via CN's own substitution
+             ([open_] -> [IT.subst]); the result's free vars are the spec's
+             vars, so we evaluate it under the current subst. *)
+          let body' =
+            Cn.Definition.Function.try_open def arg_annots |> of_opt_not_impl
+          in
+          eval_annot subst body'
+      | Some { body = Rec_Def _ | Uninterp; _ } -> (
+          (* Uninterpreted at the solver; equations come from [unfold]. *)
+          let fn = HAdt.adt_name fsym in
+          match AE.find_fun fn with
+          | None -> not_impl ()
+          | Some { arg_sorts; ret_sort; _ } ->
+              let args =
+                List.map2
+                  (fun desc a ->
+                    eval_annot subst a |> sv_of_cv desc |> of_opt_not_impl)
+                  arg_sorts arg_annots
+              in
+              cv_of_desc ret_sort
+                (Typed.fn_app ~fn ~ret_ty:(ty_of_desc ret_sort) args))
+      | None -> not_impl ())
   | ITE (g, b1, b2) -> (
       let g = eval_annot subst g in
       let b1 = eval_annot subst b1 in

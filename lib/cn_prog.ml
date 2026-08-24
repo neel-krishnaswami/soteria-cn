@@ -42,7 +42,48 @@ let execute_statement (subst : Subst.t) (stmt : Mu.cn_statement) :
   | Mu.Have _ -> InterpM.not_impl "cn statement: have"
   | Mu.Instantiate _ -> InterpM.not_impl "cn statement: instantiate"
   | Mu.Extract _ -> InterpM.not_impl "cn statement: extract"
-  | Mu.Unfold _ -> InterpM.not_impl "cn statement: unfold"
+  | Mu.Unfold (fsym, arg_annots) -> (
+      match Ctx.get_fun_def fsym with
+      | None -> InterpM.not_impl "unfold: unknown function"
+      | Some def -> (
+          match def.body with
+          | Def _ ->
+              (* Non-recursive definitions are inlined at every application;
+                 nothing to assert. *)
+              InterpM.ok ()
+          | Uninterp ->
+              InterpM.not_impl
+                "unfold: cannot unfold an uninterpreted function"
+          | Rec_Def _ -> (
+              let fn = Soteria_c_helpers.Adt.adt_name fsym in
+              match Soteria_c_vendor.Adt_ext.find_fun fn with
+              | None -> InterpM.not_impl "unfold: function not registered"
+              | Some { arg_sorts; ret_sort; _ } ->
+                  let open InterpM.Syntax in
+                  (* One capture-avoiding unrolling, via CN's own machinery. *)
+                  let rhs_it =
+                    Cn.Definition.Function.unroll_once def arg_annots
+                    |> Option.get
+                  in
+                  let*^ rhs = Subst.eval_annot subst rhs_it in
+                  let*^ args =
+                    Csymex.map_list
+                      ~f:(fun (desc, a) ->
+                        let open Csymex.Syntax in
+                        let* v = Subst.eval_annot subst a in
+                        Subst.sv_of_cv desc v
+                        |> Soteria_c_helpers.of_opt_not_impl
+                             ~msg:"unfold: argument sort mismatch")
+                      (List.combine arg_sorts arg_annots)
+                  in
+                  let lhs =
+                    Subst.cv_of_desc ret_sort
+                      (Typed.fn_app ~fn
+                         ~ret_ty:(Subst.ty_of_desc ret_sort)
+                         args)
+                  in
+                  InterpM.lift
+                    (Csymex.assume [ Core_value.sem_eq lhs rhs ]))))
   | Mu.Apply _ -> InterpM.not_impl "cn statement: apply"
   | Mu.Inline _ -> InterpM.not_impl "cn statement: inline"
   | Mu.Print _ -> InterpM.not_impl "cn statement: print"

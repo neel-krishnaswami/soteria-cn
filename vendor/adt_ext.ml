@@ -20,9 +20,18 @@ type sort_desc =
 type con_def = { con : string; fields : (string * sort_desc) list }
 type adt_def = { adt : string; cons : con_def list }
 
+type fun_def = { fn : string; arg_sorts : sort_desc list; ret_sort : sort_desc }
+
 let registry : (string, adt_def) Hashtbl.t = Hashtbl.create 16
+let fun_registry : (string, fun_def) Hashtbl.t = Hashtbl.create 16
 let register (def : adt_def) = Hashtbl.replace registry def.adt def
-let reset () = Hashtbl.reset registry
+let register_fun (def : fun_def) = Hashtbl.replace fun_registry def.fn def
+let find_fun fn = Hashtbl.find_opt fun_registry fn
+
+let reset () =
+  Hashtbl.reset registry;
+  Hashtbl.reset fun_registry
+
 let find_def adt = Hashtbl.find_opt registry adt
 
 let find_con adt con =
@@ -62,6 +71,8 @@ type 'g t =
       v : ('g, 'g t, 'g ty) Svalue.t;
     }
 
+  | App of { fn : string; args : ('g, 'g t, 'g ty) Svalue.t list }
+
 and 'g ty = TAdt of string
 
 let equal_ty _ (TAdt a) (TAdt b) = String.equal a b
@@ -81,10 +92,13 @@ let equal _ x y =
       String.equal a.adt b.adt && String.equal a.con b.con
       && String.equal a.field b.field
       && Int.equal (tag a.v) (tag b.v)
+  | App a, App b ->
+      String.equal a.fn b.fn
+      && List.equal (fun l r -> Int.equal (tag l) (tag r)) a.args b.args
   | _ -> false
 
 let compare _ x y =
-  let int_of = function Constr _ -> 0 | Tester _ -> 1 | Sel _ -> 2 in
+  let int_of = function Constr _ -> 0 | Tester _ -> 1 | Sel _ -> 2 | App _ -> 3 in
   match (x, y) with
   | Constr a, Constr b ->
       let c = String.compare a.adt b.adt in
@@ -105,6 +119,10 @@ let compare _ x y =
         else
           let c = String.compare a.field b.field in
           if c <> 0 then c else Int.compare (tag a.v) (tag b.v)
+  | App a, App b ->
+      let c = String.compare a.fn b.fn in
+      if c <> 0 then c
+      else List.compare (fun l r -> Int.compare (tag l) (tag r)) a.args b.args
   | _ -> Int.compare (int_of x) (int_of y)
 
 let hash x =
@@ -113,6 +131,7 @@ let hash x =
       Hashtbl.hash (0, adt, con, List.map tag args)
   | Tester { con; v } -> Hashtbl.hash (1, con, tag v)
   | Sel { adt; con; field; v } -> Hashtbl.hash (2, adt, con, field, tag v)
+  | App { fn; args } -> Hashtbl.hash (3, fn, List.map tag args)
 
 let pp pp_super ft x =
   match x with
@@ -121,10 +140,12 @@ let pp pp_super ft x =
   | Tester { con; v } -> Fmt.pf ft "@[<2>(is %s@ %a)@]" con pp_super v
   | Sel { con; field; v; _ } ->
       Fmt.pf ft "@[<2>%a.%s.%s@]" pp_super v con field
+  | App { fn; args } ->
+      Fmt.pf ft "@[<2>%s(%a)@]" fn (Fmt.list ~sep:Fmt.comma pp_super) args
 
 let iter_vars f x =
   match x with
-  | Constr { args; _ } -> List.iter f args
+  | Constr { args; _ } | App { args; _ } -> List.iter f args
   | Tester { v; _ } | Sel { v; _ } -> f v
 
 (** Smart constructor: selector-of-constructor projects; tester-of-constructor
@@ -144,19 +165,23 @@ let mk build ty x =
       | Svalue.Extension (Constr { con = con'; _ }) ->
           build (Svalue.Bool (String.equal con con')) Svalue.TBool
       | _ -> build (Svalue.Extension x) ty)
-  | Constr _ -> build (Svalue.Extension x) ty
+  | Constr _ | App _ -> build (Svalue.Extension x) ty
 
 let eval f x =
+  let map_args args =
+    List.fold_left
+      (fun (acc, ch) a ->
+        let a' = f a in
+        (a' :: acc, ch || a' != a))
+      ([], false) args
+  in
   match x with
   | Constr c ->
-      let args, changed =
-        List.fold_left
-          (fun (acc, ch) a ->
-            let a' = f a in
-            (a' :: acc, ch || a' != a))
-          ([], false) c.args
-      in
+      let args, changed = map_args c.args in
       if changed then Constr { c with args = List.rev args } else x
+  | App a ->
+      let args, changed = map_args a.args in
+      if changed then App { a with args = List.rev args } else x
   | Tester t ->
       let v = f t.v in
       if v == t.v then x else Tester { t with v }
@@ -165,16 +190,23 @@ let eval f x =
       if v == s.v then x else Sel { s with v }
 
 let apply_subst sub ~missing_var st x =
+  let sub_args st args =
+    let st, rev_args =
+      List.fold_left
+        (fun (st, acc) a ->
+          let a, st = sub ~missing_var st a in
+          (st, a :: acc))
+        (st, []) args
+    in
+    (st, List.rev rev_args)
+  in
   match x with
   | Constr c ->
-      let st, rev_args =
-        List.fold_left
-          (fun (st, acc) a ->
-            let a, st = sub ~missing_var st a in
-            (st, a :: acc))
-          (st, []) c.args
-      in
-      (Constr { c with args = List.rev rev_args }, st)
+      let st, args = sub_args st c.args in
+      (Constr { c with args }, st)
+  | App a ->
+      let st, args = sub_args st a.args in
+      (App { a with args }, st)
   | Tester t ->
       let v, st = sub ~missing_var st t.v in
       (Tester { t with v }, st)
@@ -210,23 +242,43 @@ let declare_group (enc_sort : sort_desc -> Smt.sexp) : Smt.sexp =
       Smt.List (List.map per_adt defs);
     ]
 
+let enc_sort_with (enc : 'g ty Svalue.ty -> Smt.sexp) : sort_desc -> Smt.sexp =
+  function
+  | DBool -> enc Svalue.TBool
+  | DBits n -> enc (Svalue.TBitVector n)
+  | DPtr n -> enc (Svalue.TPointer n)
+  | DLoc n -> enc (Svalue.TLoc n)
+  | DAdt s -> Smt.Atom s
+
+(* The datatype group must be declared before ANY use of an ADT sort or
+   constructor/selector/tester/function symbol — including ground terms whose
+   sorts never go through [encode_ty] (no ADT-sorted variable in the query). *)
+let declare_adts (enc : 'g ty Svalue.ty -> Smt.sexp) : unit =
+  if Hashtbl.length registry > 0 then
+    Decls.declare ~key:adts_key (fun yield ->
+        yield (declare_group (enc_sort_with enc)))
+
 let encode_ty (enc : 'g ty Svalue.ty -> Smt.sexp) (TAdt name : 'g ty) :
     Smt.sexp =
-  let enc_sort : sort_desc -> Smt.sexp = function
-    | DBool -> enc Svalue.TBool
-    | DBits n -> enc (Svalue.TBitVector n)
-    | DPtr n -> enc (Svalue.TPointer n)
-    | DLoc n -> enc (Svalue.TLoc n)
-    | DAdt s -> Smt.Atom s
-  in
-  Decls.declare ~key:adts_key (fun yield -> yield (declare_group enc_sort));
+  declare_adts enc;
   Smt.Atom name
 
-let encode_value (_enc_ty : 'g ty Svalue.ty -> Smt.sexp)
+let encode_value (enc_ty : 'g ty Svalue.ty -> Smt.sexp)
     (enc : ('g, 'g t, 'g ty) Svalue.t -> Smt.sexp) ~ty:_ (x : 'g t) : Smt.sexp
     =
   let open Smt in
+  declare_adts enc_ty;
   match x with
   | Constr { con; args; _ } -> app_ con (List.map enc args)
   | Tester { con; v } -> app (fam "is" [ Atom con ]) [ enc v ]
   | Sel { adt; con; field; v } -> app_ (sel_name adt con field) [ enc v ]
+  | App { fn; args } ->
+      (match find_fun fn with
+      | Some { arg_sorts; ret_sort; _ } ->
+          let enc_sort = enc_sort_with enc_ty in
+          Decls.declare ~key:("cn-fun-" ^ fn) (fun yield ->
+              yield
+                (declare_fun fn (List.map enc_sort arg_sorts)
+                   (enc_sort ret_sort)))
+      | None -> ());
+      app_ fn (List.map enc args)

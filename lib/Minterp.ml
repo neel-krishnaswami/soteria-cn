@@ -137,6 +137,11 @@ let eval_iop ~(wrapping : bool) (iop : CF.Core.iop) (lhs : Typed.(T.sint t))
       arith_op
         ~check_signed_ovf:(Typed.BitVec.sub_overflows ~signed:true)
         ~checked_op:( -!!@ ) ~unchecked_op:( -!@ )
+  | IOpMul ->
+      arith_op
+        ~check_signed_ovf:(Typed.BitVec.mul_overflows ~signed:true)
+        ~checked_op:(fun a b -> Typed.cast (Typed.BitVec.mul a b))
+        ~unchecked_op:(fun a b -> Typed.cast (Typed.BitVec.mul a b))
   | _ -> not_impl "unsupported iop"
 
 let cfunction (v : Core_value.t) =

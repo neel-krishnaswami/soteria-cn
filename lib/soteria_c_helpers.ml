@@ -62,4 +62,29 @@ module Adt = struct
         in
         Adt_ext.register { adt; cons })
       datatypes
+
+  (* Register solver signatures for the functions that stay uninterpreted
+     ([Rec_Def]/[Uninterp]); non-recursive [Def]s are always inlined. *)
+  let register_functions
+      (functions : (Symbol_std.t * Cn.Definition.Function.t) list) : unit =
+    List.iter
+      (fun ((fsym, def) : _ * Cn.Definition.Function.t) ->
+        match def.body with
+        | Def _ -> ()
+        | Rec_Def _ | Uninterp ->
+            let fn = adt_name fsym in
+            let desc bt =
+              match desc_of_bt bt with
+              | Some d -> d
+              | None ->
+                  Soteria.Logs.Import.L.failwith
+                    "Unsupported sort in logical function %s" fn
+            in
+            Adt_ext.register_fun
+              {
+                fn;
+                arg_sorts = List.map (fun (_, bt) -> desc bt) def.args;
+                ret_sort = desc def.return_bt;
+              })
+      functions
 end
