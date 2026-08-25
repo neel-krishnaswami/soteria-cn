@@ -64,6 +64,20 @@ let cell_desc_of_qname (qname : Mu.Request.QPredicate.name) :
   | QOwned (ty, _) -> Soteria_c_helpers.Adt.desc_of_bt (Cn.Memory.bt_of_sct ty)
   | QPName _ -> None
 
+(** The permission [q < n] for an [n]-element array, built as an IT and
+    evaluated through the standard evaluator so that array-form and each-form
+    permissions can never diverge (e.g. on comparison signedness). *)
+let array_perm ~(q_bt : Cn.BaseTypes.t) (n : int) : State.Qpreds.perm =
+  let here = Cn.Locations.other "soteria-cn array permission" in
+  let qsym = Cn.Sym.fresh "i" in
+  let it =
+    Cn.IndexTerms.lt_
+      ( Cn.IndexTerms.sym_ (qsym, q_bt, here),
+        Cn.IndexTerms.num_lit_ (Z.of_int n) q_bt here )
+      here
+  in
+  perm_closure ~qsym ~q_bt it Subst.empty
+
 (** The port of CN's [qpredicate_request]: consume an [each] footprint from the
     movable-index cells and the held Q chunks, and assemble the map output. *)
 let consume_qpred ~(qname : Mu.Request.QPredicate.name)
@@ -302,6 +316,29 @@ and produce_owned_resource ~cty ~(kind : Mu.Request.init) ~ptr ty =
     Core_value.cast_ptr ptr
     |> of_opt_not_impl ~msg:"produce_resource: not a pointer"
   in
+  match cty with
+  | Cn.Sctypes.Array (ict, Some n) ->
+      (* Owned-array unfolds to an [each] chunk (CN's [unfolded_array]):
+         footprint at every index in [0, n), map-valued output. *)
+      let q_bt = Cn.Memory.uintptr_bt in
+      let perm = array_perm ~q_bt n in
+      let*^ out = Core_value.nondet_bt ty in
+      let+ () =
+        Producer.lift_state
+          (State.add_qpred
+             {
+               qname = QOwned (ict, kind);
+               pointer = ptr;
+               q_bt;
+               step = ict;
+               perm;
+               out;
+             })
+      in
+      out
+  | Array (_, None) ->
+      Producer.lift @@ not_impl "produce: array without a known length"
+  | _ -> (
   match kind with
   | Init ->
       let*^ v = Core_value.nondet_bt ty in
@@ -312,7 +349,7 @@ and produce_owned_resource ~cty ~(kind : Mu.Request.init) ~ptr ty =
       let ofs = Typed.Ptr.ofs ptr in
       let*^ len = Layout.size_of_s (Cn.Sctypes.to_ctype cty) in
       let+ () = lift_state @@ State.produce_any' loc ofs len in
-      Core_value.Loaded Unspec
+      Core_value.Loaded Unspec)
 
 and produce_predicate (sym : Sym.t) (iargs : annot list) :
     Core_value.t Producer.t =
@@ -448,9 +485,20 @@ let consume_owned_pred cty (kind : Mu.Request.init) ptr :
     |> of_opt_not_impl ~msg:"consume_p_resource: not a pointer"
   in
   [%l.trace "@[Consuming Owned %a at %a@]" pp_okind kind Typed.ppa ptr];
-  match kind with
-  | Init -> lift_state @@ State.consume_owned ptr cty
-  | Uninit -> lift_state @@ State.consume_any ptr cty
+  match cty with
+  | Cn.Sctypes.Array (ict, Some n) ->
+      (* Owned-array consumes as its [each] form. *)
+      let q_bt = Cn.Memory.uintptr_bt in
+      let needed = array_perm ~q_bt n in
+      lift_state @@ State.lift_consumer_error
+      @@ consume_qpred
+           ~qname:(QOwned (ict, kind))
+           ~ptr ~q_bt ~step:ict ~needed
+  | Array (_, None) -> Consumer.not_impl "consume: array without a known length"
+  | _ -> (
+      match kind with
+      | Init -> lift_state @@ State.consume_owned ptr cty
+      | Uninit -> lift_state @@ State.consume_any ptr cty)
 
 let rec find_clause_consume ~subst (clauses : Mu.clause list) :
     (Core_value.t, _, _) State.SM.Result.t =
