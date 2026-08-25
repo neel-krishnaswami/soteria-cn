@@ -63,6 +63,13 @@ let add_pred_defs (umu : Usable_mucore.file) tbl : unit =
   List.iter (fun (sym, def) -> Hashtbl.add tbl sym def) umu.resource_predicates
 
 let add_fun_defs (umu : Usable_mucore.file) tbl : unit =
+  (* CN's [Definition.Function]-backed builtins (max/min per type, not,
+     is_null, ptr_eq, prov_eq, addr_eq); [Def]-bodied, so [Apply] inlines
+     them like any other definition. *)
+  List.iter
+    (fun ((_, sym, def) : Cn.Builtins.builtin_fn_def) ->
+      Hashtbl.add tbl sym def)
+    Cn.Builtins.builtin_fun_defs;
   List.iter (fun (sym, def) -> Hashtbl.add tbl sym def) umu.logical_predicates
 
 let add_lemmas (umu : Usable_mucore.file) tbl : unit =

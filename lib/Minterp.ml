@@ -163,7 +163,57 @@ let eval_ctor (ctor : CF.Core.ctor) (vs : Core_value.t list) :
   | Ctuple, vs -> ok (Tuple vs)
   | Civsizeof, [ Type ty ] ->
       let+^ size = Layout.size_of_s ty in
-      Obj (Int size)
+      Obj (Int (Typed.BitVec.fit_to ~signed:false Typed.math_bits size))
+  | Civalignof, [ Type ty ] ->
+      let+^ align = Layout.align_of_s ty in
+      Obj (Int (Typed.BitVec.fit_to ~signed:false Typed.math_bits align))
+  | Carray, vs ->
+      let cells =
+        List.map
+          (function
+            | Obj o -> Spec o
+            | Loaded l -> l
+            | v -> L.failwith "Carray: not an object value: %a" Core_value.pp v)
+          vs
+      in
+      ok (Obj (Array cells))
+  | (Civmax | Civmin), [ Type ty ] ->
+      let* int_ty = int_ty_of_ctype ~what:"Civmax/Civmin" ty in
+      let bits = Core_value.bits_of_ity int_ty in
+      let signed = Layout.is_int_ty_signed int_ty in
+      let z =
+        match ctor with
+        | Civmax ->
+            if signed then Z.pred (Z.shift_left Z.one (bits - 1))
+            else Z.pred (Z.shift_left Z.one bits)
+        | _ -> if signed then Z.neg (Z.shift_left Z.one (bits - 1)) else Z.zero
+      in
+      ok (Obj (Int (Typed.BitVec.mk_masked Typed.math_bits z)))
+  | CivCOMPL, [ Type ty; v ] ->
+      (* Complement within the type's width, re-embedded as a mathematical
+         integer. *)
+      let* int_ty = int_ty_of_ctype ~what:"CivCOMPL" ty in
+      let bits = Core_value.bits_of_ity int_ty in
+      let signed = Layout.is_int_ty_signed int_ty in
+      let* i = CV.cast_int v in
+      let i = Typed.BitVec.fit_to ~signed:false bits i in
+      let r = Typed.BitVec.not i in
+      ok (Obj (Int (Typed.BitVec.fit_to ~signed Typed.math_bits r)))
+  | (CivAND | CivOR | CivXOR), [ Type ty; a; b ] ->
+      let* int_ty = int_ty_of_ctype ~what:"CivAND/OR/XOR" ty in
+      let bits = Core_value.bits_of_ity int_ty in
+      let signed = Layout.is_int_ty_signed int_ty in
+      let* a = CV.cast_int a in
+      let* b = CV.cast_int b in
+      let a = Typed.BitVec.fit_to ~signed:false bits a in
+      let b = Typed.BitVec.fit_to ~signed:false bits b in
+      let r =
+        match ctor with
+        | CivAND -> Typed.BitVec.and_ a b
+        | CivOR -> Typed.BitVec.or_ a b
+        | _ -> Typed.BitVec.xor a b
+      in
+      ok (Obj (Int (Typed.BitVec.fit_to ~signed Typed.math_bits r)))
   | _ ->
       not_impl "Unsupported constructor: %a with args %a" Mu.pp_ctor ctor
         (Fmt.Dump.list Core_value.pp)
@@ -204,7 +254,17 @@ let eval_iop ~(int_ty : CF.Ctype.integerType) ~(wrapping : bool)
     | IOpAdd -> ok (Typed.cast (Typed.BitVec.add l r))
     | IOpSub -> ok (Typed.cast (Typed.BitVec.sub l r))
     | IOpMul -> ok (Typed.cast (Typed.BitVec.mul l r))
-    | _ -> not_impl "unsupported iop"
+    | IOpDiv ->
+        (* Division by zero is guarded by the elaboration. *)
+        ok (Typed.cast (Typed.BitVec.div ~signed:true l (Typed.cast r)))
+    | IOpRem_t ->
+        ok (Typed.cast (Typed.BitVec.rem ~signed:true l (Typed.cast r)))
+    | IOpShl -> ok (Typed.cast (Typed.BitVec.shl l r))
+    | IOpShr ->
+        ok
+          (Typed.cast
+             (if signed then Typed.BitVec.ashr l r
+              else Typed.BitVec.lshr l r))
   in
   if wrapping then
     let wrapped = Typed.BitVec.fit_to ~signed:false bits res in
@@ -239,6 +299,51 @@ let eval_memop (memop : Symbol_std.t CF.Mem_common.generic_memop)
       let* p1 = CV.cast_ptr p1 in
       let* p2 = CV.cast_ptr p2 in
       ok (Core_value.Bool (Typed.Bool.not (p1 ==@ p2)))
+  | ((PtrLt | PtrGt | PtrLe | PtrGe) as op), [ p1; p2 ] ->
+      let* p1 = CV.cast_ptr p1 in
+      let* p2 = CV.cast_ptr p2 in
+      (* Relational comparison is only defined within one object. *)
+      if%sat Typed.Ptr.loc p1 ==@ Typed.Ptr.loc p2 then
+        let o1 = Typed.Ptr.ofs p1 in
+        let o2 = Typed.Ptr.ofs p2 in
+        let b =
+          match op with
+          | PtrLt -> Typed.BitVec.lt ~signed:false o1 o2
+          | PtrGt -> Typed.BitVec.lt ~signed:false o2 o1
+          | PtrLe -> Typed.BitVec.leq ~signed:false o1 o2
+          | PtrGe -> Typed.BitVec.leq ~signed:false o2 o1
+          | _ -> assert false
+        in
+        ok (Core_value.Bool b)
+      else error `UBPointerComparison
+  | Ptrdiff, ([ Type ty; p1; p2 ] | [ p1; Type ty; p2 ]) ->
+      let* p1 = CV.cast_ptr p1 in
+      let* p2 = CV.cast_ptr p2 in
+      if%sat Typed.Ptr.loc p1 ==@ Typed.Ptr.loc p2 then
+        let*^ size = Layout.size_of_s ty in
+        let diff = Typed.BitVec.sub (Typed.Ptr.ofs p1) (Typed.Ptr.ofs p2) in
+        let q =
+          Typed.BitVec.div ~signed:true (Typed.cast diff) (Typed.cast size)
+        in
+        ok
+          (Core_value.Obj
+             (Int
+                (Typed.BitVec.fit_to ~signed:true Typed.math_bits
+                   (Typed.cast q))))
+      else error `UBPointerArithmetic
+  | PtrArrayShift, ([ p; Type ty; idx ] | [ Type ty; p; idx ]) ->
+      let* p = CV.cast_ptr p in
+      let* idx = CV.cast_int idx in
+      let*^ size = Layout.size_of_s ty in
+      let idx = Typed.BitVec.fit_to ~signed:true Typed.ptr_bits idx in
+      ok
+        (Core_value.Obj
+           (Ptr (Typed.Ptr.add_ofs p (Typed.cast (Typed.BitVec.mul idx size)))))
+  | PtrMemberShift (tag, member), [ p ] ->
+      let* p = CV.cast_ptr p in
+      let ty = CF.Ctype.(Ctype ([], Struct tag)) in
+      let+^ mem_ofs = Layout.member_ofs member ty in
+      Core_value.Obj (Ptr (Typed.Ptr.add_ofs p mem_ofs))
   | (PtrWellAligned | PtrValidForDeref), _args ->
       (* Pointer validity for dereference should be handled by the state.
          For alignment, we could also do the Soteria Rust trick of embedding the alignment in the pointer representation. *)
@@ -257,6 +362,33 @@ let eval_op (op : CF.Core.binop) (lhs : Core_value.t) (rhs : Core_value.t) =
   | OpLe -> ok @@ Core_value.leq ~signed:true lhs rhs
   | OpGt -> ok @@ Core_value.lt ~signed:true rhs lhs
   | OpGe -> ok @@ Core_value.leq ~signed:true rhs lhs
+  | OpAdd | OpSub | OpMul | OpDiv | OpRem_t | OpRem_f -> (
+      (* Arithmetic on Core mathematical integers ([math_bits]-wide). The
+         elaboration guards division by zero separately. *)
+      let* l = CV.cast_int lhs in
+      let* r = CV.cast_int rhs in
+      let res =
+        match op with
+        | OpAdd -> Typed.cast (Typed.BitVec.add l r)
+        | OpSub -> Typed.cast (Typed.BitVec.sub l r)
+        | OpMul -> Typed.cast (Typed.BitVec.mul l r)
+        | OpDiv -> Typed.cast (Typed.BitVec.div ~signed:true l (Typed.cast r))
+        | OpRem_t ->
+            Typed.cast (Typed.BitVec.rem ~signed:true l (Typed.cast r))
+        | _ -> Typed.cast (Typed.BitVec.mod_ l r)
+      in
+      ok (Obj (Int res)))
+  | OpExp -> (
+      let* l = CV.cast_int lhs in
+      let* r = CV.cast_int rhs in
+      match (Typed.BitVec.to_z l, Typed.BitVec.to_z r) with
+      | Some b, Some e when Z.fits_int e && Z.geq e Z.zero ->
+          ok
+            (Obj
+               (Int
+                  (Typed.BitVec.mk_masked Typed.math_bits
+                     (Z.pow b (Z.to_int e)))))
+      | _ -> not_impl "OpExp: symbolic exponent")
   | _ -> not_impl "eval_op: unsupported operator: %a" Mu.pp_binop op
 
 let rec eval_action (subst : Subst.t) (action : action) : Core_value.t InterpM.t
@@ -314,6 +446,21 @@ and eval_call ~loc (sym : Sym.t) (args : Core_value.t list) :
           Core_value.(Obj (Int i))
       | Loaded Unspec -> ok (Core_value.Loaded Unspec)
       | _ -> L.failwith "Invalid input to conv_int %a" Core_value.pp i)
+  | Symbol (_, _, SD_Id "is_representable_integer"), [ a; b ] ->
+      let v, ty =
+        match Core_value.cast_type a with Some _ -> (b, a) | None -> (a, b)
+      in
+      let* i = CV.cast_int v in
+      let* ty = CV.cast_type ty in
+      let* int_ty = int_ty_of_ctype ~what:"is_representable_integer" ty in
+      ok (Core_value.Bool (in_ity_range int_ty i))
+  | Symbol (_, _, SD_Id "ctype_width"), [ ty ] ->
+      let* ty = CV.cast_type ty in
+      let* int_ty = int_ty_of_ctype ~what:"ctype_width" ty in
+      let bits = Core_value.bits_of_ity int_ty in
+      ok
+        (Core_value.Obj
+           (Int (Typed.BitVec.mk_masked Typed.math_bits (Z.of_int bits))))
   | Symbol (_, _, SD_Id "params_length"), [ List l ] ->
       ok @@ Core_value.c_int (List.length l)
   | ( Symbol (_, _, SD_Id "params_nth"),
@@ -426,7 +573,9 @@ and eval_pexpr (subst : Subst.t) (pexpr : pexpr) =
       Core_value.Obj (Ptr (Typed.Ptr.add_ofs ptr mem_ofs))
   | PEmemop _ -> not_impl "PEmemop"
   | PEconstrained _ -> not_impl "PEconstrainted"
-  | PEerror _ -> not_impl "PEerror"
+  | PEerror (msg, _) ->
+      [%l.debug "Reached PEerror: %s" msg];
+      error `FailedAssert
   | PEarray_shift { base; ty; index } ->
       let* base_v = eval_pexpr subst base in
       let* bptr = CV.cast_ptr base_v in
@@ -437,9 +586,66 @@ and eval_pexpr (subst : Subst.t) (pexpr : pexpr) =
       ok
         (Core_value.Obj
            (Ptr (Typed.Ptr.add_ofs bptr (Typed.cast (Typed.BitVec.mul idx size)))))
-  | PEstruct _ -> not_impl "PEstruct"
+  | PEstruct (tag, fields) ->
+      let* fields =
+        map_list fields ~f:(fun (id, pe) ->
+            let+ v = eval_pexpr subst pe in
+            (id, v))
+      in
+      let prog = Ctx.get_prog () in
+      let* members =
+        match Sym.Map.find_opt tag prog.tag_defs with
+        | Some (StructDef layout) ->
+            InterpM.ok
+              (List.filter_map
+                 (fun (piece : Cn.Memory.struct_piece) ->
+                   match piece.member_or_padding with
+                   | None -> None
+                   | Some (id, _) ->
+                       let v =
+                         List.find_map
+                           (fun (id', v) ->
+                             if Cn.Id.equal id id' then Some v else None)
+                           fields
+                       in
+                       Some
+                         (match v with
+                         | Some (Core_value.Obj o) -> Core_value.Spec o
+                         | Some (Loaded l) -> l
+                         | _ -> Core_value.Unspec))
+                 layout)
+        | _ -> not_impl "PEstruct: unknown struct tag"
+      in
+      ok (Core_value.Obj (Struct { tag; members }))
   | PEunion _ -> not_impl "PEunion"
-  | PEmemberof _ -> not_impl "PEmemberof"
+  | PEmemberof { tag; member; value } -> (
+      let* v = eval_pexpr subst value in
+      let prog = Ctx.get_prog () in
+      let* members =
+        match v with
+        | Obj (Struct { members; _ }) | Loaded (Spec (Struct { members; _ }))
+          ->
+            InterpM.ok members
+        | _ -> not_impl "PEmemberof: not a struct value"
+      in
+      match Sym.Map.find_opt tag prog.tag_defs with
+      | Some (StructDef layout) -> (
+          let member_ids =
+            List.filter_map
+              (fun (piece : Cn.Memory.struct_piece) ->
+                Option.map fst piece.member_or_padding)
+              layout
+          in
+          match
+            List.find_index (fun id -> Cn.Id.equal id member) member_ids
+          with
+          | Some i -> (
+              match List.nth_opt members i with
+              | Some (Core_value.Spec o) -> ok (Core_value.Obj o)
+              | Some Unspec -> ok (Core_value.Loaded Unspec)
+              | None -> not_impl "PEmemberof: member index out of range")
+          | None -> not_impl "PEmemberof: unknown member")
+      | _ -> not_impl "PEmemberof: unknown struct tag")
 
 and eval_expr ~(labels : label_def Sym.Map.t) (subst : Subst.t) (body : expr) :
     Core_value.t ExprM.t =

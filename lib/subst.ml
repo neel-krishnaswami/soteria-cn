@@ -152,6 +152,17 @@ and ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
   | DMap (k, v) -> Typed.t_map k v
   | DRecord fields -> Typed.t_adt (AE.register_record fields)
 
+(* CN struct layouts of the current program, for [Good]/[Representable]
+   expansion and [OffsetOf]/[MemberShift]. *)
+let struct_decls () : Cn.Memory.struct_decls =
+  let prog = Ctx.get_prog () in
+  Symbol_std.Map.fold
+    (fun tag def acc ->
+      match def with
+      | Mu.StructDef layout -> Cn.Sym.Map.add tag layout acc
+      | Mu.UnionDef -> acc)
+    prog.tag_defs Cn.Sym.Map.empty
+
 let ite_val ~of_opt_not_impl ~fail g (b1 : Core_value.t) (b2 : Core_value.t) :
     Core_value.t =
   match b1 with
@@ -218,9 +229,26 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
       | Add -> int_op (fun a b -> a +!@ b)
       | Sub -> int_op (fun a b -> Typed.BitVec.sub a b)
       | Mul -> int_op (fun a b -> Typed.BitVec.mul a b)
-      | Div -> int_op (fun a b -> Typed.BitVec.div ~signed a (Typed.cast b))
-      | Rem -> int_op (fun a b -> Typed.BitVec.rem ~signed a (Typed.cast b))
-      | Mod -> int_op (fun a b -> Typed.BitVec.mod_ a b)
+      | Div | DivNoSMT ->
+          int_op (fun a b -> Typed.BitVec.div ~signed a (Typed.cast b))
+      | Rem | RemNoSMT ->
+          int_op (fun a b -> Typed.BitVec.rem ~signed a (Typed.cast b))
+      | Mod | ModNoSMT -> int_op (fun a b -> Typed.BitVec.mod_ a b)
+      | MulNoSMT -> int_op (fun a b -> Typed.cast (Typed.BitVec.mul a b))
+      | BW_And -> int_op Typed.BitVec.and_
+      | BW_Or -> int_op Typed.BitVec.or_
+      | BW_Xor -> int_op Typed.BitVec.xor
+      | ShiftLeft -> int_op Typed.BitVec.shl
+      | ShiftRight ->
+          int_op (if signed then Typed.BitVec.ashr else Typed.BitVec.lshr)
+      | Exp | ExpNoSMT -> (
+          (* Concrete exponent only, as in CN. *)
+          let i1, i2 = ints () in
+          match (Typed.BitVec.to_z i1, Typed.BitVec.to_z i2) with
+          | Some b, Some e when Z.fits_int e && Z.geq e Z.zero ->
+              let w = Typed.size_of_int i1 in
+              Obj (Int (Typed.BitVec.mk_masked w (Z.pow b (Z.to_int e))))
+          | _ -> not_impl ())
       | Min ->
           let i1, i2 = ints () in
           Obj (Int (Typed.ite (Typed.BitVec.lt ~signed i1 i2) i1 i2))
@@ -238,6 +266,9 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
           let i = Core_value.cast_int v |> of_opt_not_impl in
           let zero = Typed.BitVec.zero (Typed.size_of_int i) in
           Obj (Int (Typed.cast (Typed.BitVec.sub zero i)))
+      | BW_Compl ->
+          let i = Core_value.cast_int v |> of_opt_not_impl in
+          Obj (Int (Typed.BitVec.not i))
       | _ ->
           [%l.trace "Not impl unop?"];
           not_impl ())
@@ -332,9 +363,91 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
       let b2 = eval_annot subst b2 in
       let g = Core_value.cast_bool g |> of_opt_not_impl in
       ite_val ~of_opt_not_impl ~fail:not_impl g b1 b2)
-  | Good (_, _) ->
-      (* Are those pointer invariants? I don't think it should be separate from the chunk? *)
+  | SizeOf ct -> (
+      match _bt with
+      | Cn.BaseTypes.Bits (_, w) ->
+          Obj
+            (Int
+               (Typed.BitVec.mk_masked w
+                  (Z.of_int (Cn.Memory.size_of_ctype ct))))
+      | _ -> not_impl ())
+  | OffsetOf (tag, member) -> (
+      let layout =
+        match Symbol_std.Map.find_opt tag (Ctx.get_prog ()).tag_defs with
+        | Some (Mu.StructDef layout) -> layout
+        | _ -> not_impl ()
+      in
+      match (Cn.Memory.member_offset layout member, _bt) with
+      | Some off, Cn.BaseTypes.Bits (_, w) ->
+          Obj (Int (Typed.BitVec.mk_masked w (Z.of_int off)))
+      | _ -> not_impl ())
+  | ArrayShift { base; ct; index } ->
+      let bp = eval_annot subst base |> Core_value.cast_ptr |> of_opt_not_impl in
+      let idx =
+        eval_annot subst index |> Core_value.cast_int |> of_opt_not_impl
+      in
+      let signed =
+        let (IT (_, ibt, _)) = index in
+        match ibt with Cn.BaseTypes.Bits (Signed, _) -> true | _ -> false
+      in
+      let idx = Typed.BitVec.fit_to ~signed Typed.ptr_bits idx in
+      let size =
+        Typed.BitVec.mk_masked Typed.ptr_bits
+          (Z.of_int (Cn.Memory.size_of_ctype ct))
+      in
+      Obj (Ptr (Typed.Ptr.add_ofs bp (Typed.cast (Typed.BitVec.mul idx size))))
+  | MemberShift (t, tag, member) -> (
+      let p = eval_annot subst t |> Core_value.cast_ptr |> of_opt_not_impl in
+      let layout =
+        match Symbol_std.Map.find_opt tag (Ctx.get_prog ()).tag_defs with
+        | Some (Mu.StructDef layout) -> layout
+        | _ -> not_impl ()
+      in
+      match Cn.Memory.member_offset layout member with
+      | Some off ->
+          Obj
+            (Ptr
+               (Typed.Ptr.add_ofs p
+                  (Typed.BitVec.mk_masked Typed.ptr_bits (Z.of_int off))))
+      | None -> not_impl ())
+  | Cast (target_bt, t') -> (
+      let (IT (_, src_bt, _)) = t' in
+      match (target_bt, src_bt) with
+      | Cn.BaseTypes.Bits (tsign, tw), Cn.BaseTypes.Bits (ssign, _) ->
+          let _ = tsign in
+          let i =
+            eval_annot subst t' |> Core_value.cast_int |> of_opt_not_impl
+          in
+          let signed = match ssign with Cn.BaseTypes.Signed -> true | _ -> false in
+          Obj (Int (Typed.BitVec.fit_to ~signed tw i))
+      | Cn.BaseTypes.Alloc_id, Cn.BaseTypes.Loc _ ->
+          (* An allocation id, represented as the pointer's location with a
+             zeroed offset — only its equality is ever used (prov_eq). *)
+          let p =
+            eval_annot subst t' |> Core_value.cast_ptr |> of_opt_not_impl
+          in
+          Obj
+            (Ptr
+               (Typed.Ptr.mk (Typed.Ptr.loc p)
+                  (Typed.BitVec.zero Typed.ptr_bits)))
+      | _ -> not_impl ())
+  | WrapI (ity, t') ->
+      let i = eval_annot subst t' |> Core_value.cast_int |> of_opt_not_impl in
+      let bits = Core_value.bits_of_ity ity in
+      Obj (Int (Typed.BitVec.fit_to ~signed:false bits i))
+  | HasAllocId t' ->
+      let p = eval_annot subst t' |> Core_value.cast_ptr |> of_opt_not_impl in
+      Bool (Typed.not (Typed.Ptr.is_null_loc (Typed.Ptr.loc p)))
+  | Aligned _ ->
+      (* The memory model does not track alignment (cf. soteria-c's
+         [PtrWellAligned]); alignment facts are trivially true in it. *)
       Core_value.true_
+  | Representable (ct, t') ->
+      eval_annot subst (Cn.IndexTerms.representable (struct_decls ()) ct t' _loc)
+  | Good (ct, t') ->
+      (* CN expands [good]/[representable] into range/member/array
+         constraints; reuse its expansion and evaluate the result. *)
+      eval_annot subst (Cn.IndexTerms.good_value (struct_decls ()) ct t' _loc)
   | MapGet (m_t, k_t) -> (
       let (IT (_, mbt, _)) = m_t in
       match HAdt.desc_of_bt mbt with
