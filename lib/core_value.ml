@@ -453,6 +453,25 @@ let rec sem_eq v1 v2 =
   | Bool b1, Bool b2 -> b1 ==@ b2
   | Adt a1, Adt a2 -> a1 ==@ a2
   | Map m1, Map m2 -> m1 ==@ m2
+  | Record f1, Record f2 ->
+      (* Fields are compared by name; a shape mismatch is [false]. *)
+      let find fs id =
+        List.find_map
+          (fun (id', v) -> if Id.equal id id' then Some v else None)
+          fs
+      in
+      if
+        List.length f1 <> List.length f2
+        || Stdlib.not
+             (List.for_all (fun (id, _) -> Option.is_some (find f2 id)) f1)
+      then Typed.v_false
+      else
+        List.fold_left
+          (fun acc (id, v1) ->
+            match find f2 id with
+            | Some v2 -> acc &&@ sem_eq v1 v2
+            | None -> Typed.v_false)
+          Typed.v_true f1
   | _ -> Typed.v_false
 
 module Syntax = struct

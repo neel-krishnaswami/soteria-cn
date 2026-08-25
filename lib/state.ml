@@ -70,20 +70,29 @@ module Uninterpreted =
 type annot = Cn.(BaseTypes.t Terms.annot)
 
 module Facts = struct
-  (** A quantified assumption [forall (q : q_bt). body], with [snapshot]
-      closing the body's free spec variables. Never sent to the solver as a
-      quantifier; used by [instantiate] (CN's QF discipline). *)
-  type fact = {
-    q : Symbol_std.t;
-    q_bt : Cn.BaseTypes.t;
-    body : annot;
-    snapshot : Subst.t;
-  }
+  (** A quantified assumption [forall (q : q_bt). body]. Never sent to the
+      solver as a quantifier; used by [instantiate] (CN's QF discipline).
+      [FIt] carries a spec term with [snapshot] closing its free variables;
+      [FClosure] carries an already-closed body (e.g. the per-index value
+      equalities of a merged [each] output). *)
+  type fact =
+    | FIt of {
+        q : Symbol_std.t;
+        q_bt : Cn.BaseTypes.t;
+        body : annot;
+        snapshot : Subst.t;
+      }
+    | FClosure of {
+        q_bt : Cn.BaseTypes.t;
+        body : Typed.T.sint Typed.t -> Typed.T.sbool Typed.t Csymex.t;
+      }
 
   type t = fact list
 
-  let pp_fact ft { q; body; _ } =
-    Fmt.pf ft "@[<2>forall %a.@ %a@]" Symbol_std.pp_hum q Mu.pp_it body
+  let pp_fact ft = function
+    | FIt { q; body; _ } ->
+        Fmt.pf ft "@[<2>forall %a.@ %a@]" Symbol_std.pp_hum q Mu.pp_it body
+    | FClosure _ -> Fmt.pf ft "<closure fact>"
 
   let pp = Fmt.Dump.list pp_fact
 end
@@ -114,6 +123,10 @@ module Qpreds = struct
       and immutable, so the state stays persistent. *)
   type perm = Typed.T.sint Typed.t -> Typed.T.sbool Typed.t Csymex.t
 
+  type iargs = Typed.T.sint Typed.t -> Core_value.t list Csymex.t
+  (** The predicate's extra input arguments, as a function of the index
+      (empty for [Owned] eaches). *)
+
   (** An [each] chunk: footprint at [pointer + q*step] for every index [q]
       satisfying [perm]; [out] is the map-valued output. *)
   type chunk = {
@@ -122,6 +135,7 @@ module Qpreds = struct
     q_bt : Cn.BaseTypes.t;
     step : Cn.Sctypes.t;
     perm : perm;
+    iargs : iargs;
     out : Core_value.t;
   }
 

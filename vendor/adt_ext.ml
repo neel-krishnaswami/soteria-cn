@@ -17,6 +17,10 @@ type sort_desc =
   | DLoc of int
   | DAdt of string
   | DMap of sort_desc * sort_desc
+  | DRecord of (string * sort_desc) list
+      (** CN record; encoded as a single-constructor datatype named after its
+          shape. Records are non-recursive, so each shape can be declared on
+          first use (unlike the mutually recursive user datatype group). *)
 
 type con_def = { con : string; fields : (string * sort_desc) list }
 type adt_def = { adt : string; cons : con_def list }
@@ -24,6 +28,7 @@ type adt_def = { adt : string; cons : con_def list }
 type fun_def = { fn : string; arg_sorts : sort_desc list; ret_sort : sort_desc }
 
 let registry : (string, adt_def) Hashtbl.t = Hashtbl.create 16
+let record_registry : (string, adt_def) Hashtbl.t = Hashtbl.create 16
 let fun_registry : (string, fun_def) Hashtbl.t = Hashtbl.create 16
 let register (def : adt_def) = Hashtbl.replace registry def.adt def
 let register_fun (def : fun_def) = Hashtbl.replace fun_registry def.fn def
@@ -31,9 +36,13 @@ let find_fun fn = Hashtbl.find_opt fun_registry fn
 
 let reset () =
   Hashtbl.reset registry;
+  Hashtbl.reset record_registry;
   Hashtbl.reset fun_registry
 
-let find_def adt = Hashtbl.find_opt registry adt
+let find_def adt =
+  match Hashtbl.find_opt registry adt with
+  | Some d -> Some d
+  | None -> Hashtbl.find_opt record_registry adt
 
 let find_con adt con =
   match find_def adt with
@@ -63,6 +72,22 @@ let rec sort_mangle = function
   | DLoc n -> Printf.sprintf "loc%d" n
   | DAdt s -> s
   | DMap (k, v) -> Printf.sprintf "map.%s.%s" (sort_mangle k) (sort_mangle v)
+  | DRecord fields -> record_name fields
+
+and record_name fields =
+  "rec"
+  ^ String.concat ""
+      (List.map (fun (f, d) -> "." ^ f ^ "_" ^ sort_mangle d) fields)
+
+let record_con name = "mk-" ^ name
+
+(** Idempotently register a record shape; returns its sort name. *)
+let register_record (fields : (string * sort_desc) list) : string =
+  let name = record_name fields in
+  if not (Hashtbl.mem record_registry name) then
+    Hashtbl.replace record_registry name
+      { adt = name; cons = [ { con = record_con name; fields } ] };
+  name
 
 (* ─────────────────────── the value extension ─────────────────────── *)
 
@@ -370,6 +395,27 @@ let rec enc_sort_with (enc : 'g ty Svalue.ty -> Smt.sexp) :
   | DAdt s -> Smt.Atom s
   | DMap (k, v) ->
       Smt.List [ Smt.Atom "Array"; enc_sort_with enc k; enc_sort_with enc v ]
+  | DRecord fields ->
+      let name = register_record fields in
+      (* Encode the field sorts first so nested record shapes get declared
+         before this one. *)
+      let field_sorts = List.map (fun (_, d) -> enc_sort_with enc d) fields in
+      Decls.declare ~key:("cn-record-" ^ name) (fun yield ->
+          let con = record_con name in
+          let sels =
+            List.map2
+              (fun (f, _) sort ->
+                Smt.List [ Smt.Atom (sel_name name con f); sort ])
+              fields field_sorts
+          in
+          yield
+            (Smt.List
+               [
+                 Smt.Atom "declare-datatypes";
+                 Smt.List [ Smt.List [ Smt.Atom name; Smt.Atom "0" ] ];
+                 Smt.List [ Smt.List [ Smt.List (Smt.Atom con :: sels) ] ];
+               ]));
+      Smt.Atom name
 
 (* The datatype group must be declared before ANY use of an ADT sort or
    constructor/selector/tester/function symbol — including ground terms whose

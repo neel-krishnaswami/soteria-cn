@@ -41,6 +41,19 @@ let perm_closure ~qsym ~(q_bt : Cn.BaseTypes.t) (it : annot) (close : Subst.t)
   | Some b -> Csymex.return b
   | None -> Csymex.not_impl "each: permission is not a boolean"
 
+(** Close a quantified predicate's extra input arguments into an index-indexed
+    closure. *)
+let iargs_closure ~qsym ~(q_bt : Cn.BaseTypes.t) (iargs : annot list)
+    (close : Subst.t) : State.Qpreds.iargs =
+ fun i ->
+  let open Csymex.Syntax in
+  let* iv =
+    match q_bt with
+    | Cn.BaseTypes.Bits _ -> Csymex.return (Core_value.Obj (Int i))
+    | _ -> Csymex.not_impl "each: non-bitvector index sort"
+  in
+  Csymex.map_list ~f:(Subst.eval_annot (Subst.add qsym iv close)) iargs
+
 (** [true] iff [f i] is provable for an arbitrary (fresh, unconstrained) [i] —
     a sound forall-check by skolemization. *)
 let csym_holds_forall ~width (f : State.Qpreds.perm) : bool Csymex.t =
@@ -62,7 +75,9 @@ let cell_desc_of_qname (qname : Mu.Request.QPredicate.name) :
     AE.sort_desc option =
   match qname with
   | QOwned (ty, _) -> Soteria_c_helpers.Adt.desc_of_bt (Cn.Memory.bt_of_sct ty)
-  | QPName _ -> None
+  | QPName name ->
+      let def = Ctx.get_pred_def name in
+      Soteria_c_helpers.Adt.desc_of_bt (snd def.oarg)
 
 (** The permission [q < n] for an [n]-element array, built as an IT and
     evaluated through the standard evaluator so that array-form and each-form
@@ -80,9 +95,10 @@ let array_perm ~(q_bt : Cn.BaseTypes.t) (n : int) : State.Qpreds.perm =
 
 (** The port of CN's [qpredicate_request]: consume an [each] footprint from the
     movable-index cells and the held Q chunks, and assemble the map output. *)
-let consume_qpred ~(qname : Mu.Request.QPredicate.name)
+let consume_qpred ~consume_cell_pred ~(qname : Mu.Request.QPredicate.name)
     ~(ptr : Typed.T.sptr Typed.t) ~(q_bt : Cn.BaseTypes.t)
-    ~(step : Cn.Sctypes.t) ~(needed : State.Qpreds.perm) :
+    ~(step : Cn.Sctypes.t) ~(req_iargs : State.Qpreds.iargs)
+    ~(needed : State.Qpreds.perm) :
     (Core_value.t, _, State.syn list) State.SM.Result.t =
   let open State.SM in
   let open State.SM.Syntax in
@@ -119,8 +135,11 @@ let consume_qpred ~(qname : Mu.Request.QPredicate.name)
                   State.with_base (State.SState.consume_owned (cell_ptr k) ty)
               | QOwned (ty, Uninit) ->
                   State.with_base (State.SState.consume_uninit (cell_ptr k) ty)
-              | QPName _ ->
-                  lift @@ Csymex.not_impl "each over user-defined predicates"
+              | QPName name ->
+                  (* Cells of a predicate [each] are folded instances. *)
+                  let*^ extra = req_iargs k in
+                  consume_cell_pred name
+                    (Core_value.Obj (Ptr (cell_ptr k)) :: extra)
             in
             let*^ vsv =
               Subst.sv_of_cv cell_desc v
@@ -134,53 +153,73 @@ let consume_qpred ~(qname : Mu.Request.QPredicate.name)
             extract_loop needed' ((k, vsv) :: ones) rest
   in
   let** needed, ones = extract_loop needed [] movable in
-  (* Phase 2: transfer from a held Q chunk covering the (narrowed) remainder. *)
+  (* Phase 2: transfer from held Q chunks (CN's Many cases): take from each
+     matching chunk the indices where both the (narrowed) request and the
+     chunk's permission (and extra input arguments) coincide, with permission
+     surgery on both sides. *)
   let* qpreds = State.get_qpreds in
-  let rec find_chunk acc = function
-    | [] -> Csymex.return (None, List.rev acc)
-    | (c : State.Qpreds.chunk) :: rest ->
-        let open Csymex.Syntax in
-        if not (qname_equal c.qname qname && Cn.Sctypes.equal c.step step) then
-          find_chunk (c :: acc) rest
-        else
-          let* peq =
-            if%sure Typed.Infix.( ==@ ) ptr c.pointer then Csymex.return true
-            else Csymex.return false
-          in
-          if not peq then find_chunk (c :: acc) rest
+  let*^ manys, needed, qpreds' =
+    let open Csymex.Syntax in
+    let rec loop manys needed acc = function
+      | [] -> Csymex.return (List.rev manys, needed, List.rev acc)
+      | (c : State.Qpreds.chunk) :: rest ->
+          if
+            not (qname_equal c.qname qname && Cn.Sctypes.equal c.step step)
+          then loop manys needed (c :: acc) rest
           else
-            let* covered =
-              csym_holds_forall ~width (fun i ->
-                  let* nb = needed i in
-                  let+ ab = c.perm i in
-                  Typed.Bool.or_ (Typed.not nb) ab)
+            let* peq =
+              if%sure Typed.Infix.( ==@ ) ptr c.pointer then Csymex.return true
+              else Csymex.return false
             in
-            if not covered then find_chunk (c :: acc) rest
-            else Csymex.return (Some c, List.rev_append acc rest)
+            if not peq then loop manys needed (c :: acc) rest
+            else
+              (* CN's iarg_match: this chunk can only serve indices where its
+                 extra input arguments coincide with the request's. *)
+              let take i =
+                let* nb = needed i in
+                let* ab = c.perm i in
+                let* ci = c.iargs i in
+                let+ ri = req_iargs i in
+                let iargs_eq =
+                  try
+                    List.fold_left2
+                      (fun acc a b ->
+                        Typed.Bool.and_ acc (Core_value.sem_eq a b))
+                      Typed.v_true ci ri
+                  with Invalid_argument _ -> Typed.v_false
+                in
+                Typed.Bool.and_ nb (Typed.Bool.and_ ab iargs_eq)
+              in
+              let* take_empty =
+                csym_holds_forall ~width (fun i ->
+                    let+ b = take i in
+                    Typed.not b)
+              in
+              if take_empty then loop manys needed (c :: acc) rest
+              else
+                let needed' i =
+                  let* nb = needed i in
+                  let+ tb = take i in
+                  Typed.Bool.and_ nb (Typed.not tb)
+                in
+                let residual i =
+                  let* ab = c.perm i in
+                  let+ tb = take i in
+                  Typed.Bool.and_ ab (Typed.not tb)
+                in
+                let* res_empty =
+                  csym_holds_forall ~width (fun i ->
+                      let+ b = residual i in
+                      Typed.not b)
+                in
+                let acc =
+                  if res_empty then acc else { c with perm = residual } :: acc
+                in
+                loop ((take, c.out) :: manys) needed' acc rest
+    in
+    loop [] needed [] qpreds
   in
-  let*^ chunk, others = find_chunk [] qpreds in
-  let** base, needed =
-    match chunk with
-    | Some c ->
-        let residual i =
-          let open Csymex.Syntax in
-          let* ab = c.perm i in
-          let+ nb = needed i in
-          Typed.Bool.and_ ab (Typed.not nb)
-        in
-        let*^ res_empty =
-          csym_holds_forall ~width (fun i ->
-              let open Csymex.Syntax in
-              let+ b = residual i in
-              Typed.not b)
-        in
-        let qpreds' =
-          if res_empty then others else { c with perm = residual } :: others
-        in
-        let* () = State.set_qpreds qpreds' in
-        Result.ok (Some c.out, fun _ -> Csymex.return Typed.v_false)
-    | None -> Result.ok (None, needed)
-  in
+  let* () = State.set_qpreds qpreds' in
   (* Phase 3: remainder check. *)
   let*^ done_ =
     csym_holds_forall ~width (fun i ->
@@ -192,14 +231,42 @@ let consume_qpred ~(qname : Mu.Request.QPredicate.name)
     Result.miss_no_fix ~reason:"each: footprint not fully available" ()
   else
     (* Phase 4: assemble the output map (CN's cases_to_map). *)
+    let cast_map_chunk out =
+      match Core_value.cast_map out with
+      | Some m -> Result.ok m
+      | None -> lift @@ Csymex.not_impl "each: chunk output is not a map"
+    in
     let** base_map =
-      match base with
-      | Some out -> (
-          match Core_value.cast_map out with
-          | Some m -> Result.ok m
-          | None -> lift @@ Csymex.not_impl "each: chunk output is not a map")
-      | None ->
-          Result.ok (Typed.map_default ~key:key_desc ~value:cell_desc)
+      match manys with
+      | [] -> Result.ok (Typed.map_default ~key:key_desc ~value:cell_desc)
+      | [ (_take, out) ] ->
+          (* A single source chunk: its map agrees with the request wherever
+             the permission holds, and is arbitrary elsewhere — use it
+             directly. *)
+          cast_map_chunk out
+      | _ :: _ :: _ ->
+          (* Several source chunks: a fresh map, constrained per chunk by a
+             quantified fact — as in CN, these facts are quantifier-free and
+             only usable through [instantiate]. *)
+          let*^ m = Csymex.nondet (Typed.t_map key_desc cell_desc) in
+          let value_ty = Subst.ty_of_desc cell_desc in
+          let** () =
+            Result.fold_list manys ~init:() ~f:(fun () (take, out) ->
+                let** out_m = cast_map_chunk out in
+                let body i =
+                  let open Csymex.Syntax in
+                  let+ tb = take i in
+                  Typed.Bool.or_ (Typed.not tb)
+                    (Typed.Infix.( ==@ )
+                       (Typed.map_get ~value_ty m i)
+                       (Typed.map_get ~value_ty out_m i))
+                in
+                let* () =
+                  State.add_fact (State.Facts.FClosure { q_bt; body })
+                in
+                Result.ok ())
+          in
+          Result.ok m
     in
     let out =
       List.fold_left
@@ -281,7 +348,7 @@ and produce_logical_constraint (lc : Cn.LogicalConstraints.t) : unit Producer.t
       let open Producer.With_syntax in
       let* snapshot = Producer.get_state () in
       Producer.lift_state
-        (State.add_fact { q; q_bt; body; snapshot })
+        (State.add_fact (State.Facts.FIt { q; q_bt; body; snapshot }))
 
 and produce_clause (clause : Mu.clause) =
   let open Producer.With_syntax in
@@ -337,6 +404,7 @@ and produce_owned_resource ~cty ~(kind : Mu.Request.init) ~ptr ty =
                q_bt;
                step = ict;
                perm;
+               iargs = (fun _ -> Csymex.return []);
                out;
              })
       in
@@ -389,11 +457,20 @@ and produce_resource (req : Mu.Request.t) (ty : Cn.BaseTypes.t) :
       let* snapshot = Producer.get_state () in
       let qsym, q_bt = qp.q in
       let perm = perm_closure ~qsym ~q_bt qp.permission snapshot in
+      let iargs = iargs_closure ~qsym ~q_bt qp.iargs snapshot in
       let*^ out = Core_value.nondet_bt ty in
       let+ () =
         Producer.lift_state
           (State.add_qpred
-             { qname = qp.name; pointer = ptr; q_bt; step = qp.step; perm; out })
+             {
+               qname = qp.name;
+               pointer = ptr;
+               q_bt;
+               step = qp.step;
+               perm;
+               iargs;
+               out;
+             })
       in
       out
 
@@ -520,8 +597,13 @@ let consume_owned_pred cty (kind : Mu.Request.init) ptr :
       let needed = array_perm ~q_bt n in
       lift_state @@ State.lift_consumer_error
       @@ consume_qpred
+           ~consume_cell_pred:(fun _ _ ->
+             (* Unreachable: the qname is [QOwned]. *)
+             State.SM.lift @@ Csymex.not_impl "array bridge: predicate cell")
            ~qname:(QOwned (ict, kind))
-           ~ptr ~q_bt ~step:ict ~needed
+           ~ptr ~q_bt ~step:ict
+           ~req_iargs:(fun _ -> Csymex.return [])
+           ~needed
   | Array (_, None) -> Consumer.not_impl "consume: array without a known length"
   | _ -> (
       match kind with
@@ -613,8 +695,16 @@ and consume_resource (req : Mu.Request.t) : Core_value.t Consumer.t =
       let* subst = Consumer.get_subst () in
       let qsym, q_bt = qp.q in
       let needed = perm_closure ~qsym ~q_bt qp.permission subst in
+      let consume_cell_pred name ins =
+        (* [consume_predicate] returns traced errors; [consume_qpred] is
+           itself wrapped in [lift_consumer_error], so drop the trace. *)
+        State.SM.Result.map_error (fun (e, _trace) -> e)
+          (consume_predicate name ins)
+      in
+      let req_iargs = iargs_closure ~qsym ~q_bt qp.iargs subst in
       lift_state @@ State.lift_consumer_error
-      @@ consume_qpred ~qname:qp.name ~ptr ~q_bt ~step:qp.step ~needed
+      @@ consume_qpred ~consume_cell_pred ~qname:qp.name ~ptr ~q_bt
+           ~step:qp.step ~req_iargs ~needed
 
 and consume_logical_arg ((arg, (loc, _)) : Mu.logical_arg * Cn.Locations.info) :
     unit Consumer.t =

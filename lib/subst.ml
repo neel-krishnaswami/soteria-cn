@@ -82,23 +82,67 @@ module HAdt = Soteria_c_helpers.Adt
 
 (* With the transparent [Typed], every ['a Typed.t] is an svalue, so these
    conversions are mere repackagings. *)
-let sv_of_cv (desc : AE.sort_desc) (v : Core_value.t) : Typed.Svalue.t option =
+let rec sv_of_cv (desc : AE.sort_desc) (v : Core_value.t) :
+    Typed.Svalue.t option =
   match desc with
   | DBool -> Core_value.cast_bool v
   | DBits _ -> Core_value.cast_int v
   | DPtr _ | DLoc _ -> Core_value.cast_ptr v
   | DAdt _ -> Core_value.cast_adt v
   | DMap _ -> Core_value.cast_map v
+  | DRecord fields -> (
+      match v with
+      | Core_value.Adt sv -> Some sv
+      | Core_value.Record members ->
+          let name = AE.register_record fields in
+          let rec go acc = function
+            | [] -> Some (List.rev acc)
+            | (f, d) :: rest -> (
+                let mv =
+                  List.find_map
+                    (fun (id, mv) ->
+                      if String.equal (Cn.Id.get_string id) f then Some mv
+                      else None)
+                    members
+                in
+                match mv with
+                | None -> None
+                | Some mv -> (
+                    match sv_of_cv d mv with
+                    | Some sv -> go (sv :: acc) rest
+                    | None -> None))
+          in
+          Option.map
+            (fun args ->
+              (Typed.adt_constr ~adt:name ~con:(AE.record_con name) args
+                :> Typed.Svalue.t))
+            (go [] fields)
+      | _ -> None)
 
-let cv_of_desc (desc : AE.sort_desc) (sv : Typed.Svalue.t) : Core_value.t =
+let rec cv_of_desc (desc : AE.sort_desc) (sv : Typed.Svalue.t) : Core_value.t =
   match desc with
   | DBool -> Bool sv
   | DBits _ -> Obj (Int sv)
   | DPtr _ | DLoc _ -> Obj (Ptr sv)
   | DAdt _ -> Adt sv
   | DMap _ -> Map sv
+  | DRecord fields ->
+      (* Rebuild a concrete record of selector projections, so record
+         operations ([RecordMember], equality) stay structural. *)
+      let name = AE.register_record fields in
+      let con = AE.record_con name in
+      let here = Cerb_location.unknown in
+      Core_value.Record
+        (List.map
+           (fun (f, d) ->
+             let field_sv =
+               Typed.adt_sel ~adt:name ~con ~field:f ~field_ty:(ty_of_desc d)
+                 (Typed.cast sv)
+             in
+             (Cn.Id.make here f, cv_of_desc d field_sv))
+           fields)
 
-let ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
+and ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
   match desc with
   | DBool -> Soteria.Bv_values.Svalue.TBool
   | DBits n -> Soteria.Bv_values.Svalue.TBitVector n
@@ -106,6 +150,7 @@ let ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
   | DLoc n -> Soteria.Bv_values.Svalue.TLoc n
   | DAdt a -> Typed.t_adt a
   | DMap (k, v) -> Typed.t_map k v
+  | DRecord fields -> Typed.t_adt (AE.register_record fields)
 
 let ite_val ~of_opt_not_impl ~fail g (b1 : Core_value.t) (b2 : Core_value.t) :
     Core_value.t =
@@ -205,6 +250,39 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
         List.map (fun (id, t) -> (id, eval_annot subst t)) members
       in
       Core_value.Record membres
+  | EachI ((i1, (x, bt), i2), body) ->
+      (* CN's solver expands [EachI] into a conjunction over the (concrete)
+         range (solver.ml); mirror it, with a safety cap on the range size. *)
+      if i2 - i1 > 10_000 then (
+        [%l.warn "EachI range too large to expand (%d..%d)" i1 i2];
+        not_impl ())
+      else if i1 > i2 then Core_value.Bool Typed.v_true
+      else
+        (* The body types [x] as mathematical [integer] (CN re-types it via
+           WellTyped before its solver expands); bind the index in the
+           evaluation environment instead — capture-safe, since evaluation is
+           environment-based. The index value is built at the quantifier's
+           declared width. *)
+        let width =
+          match bt with
+          | Cn.BaseTypes.Bits (_, n) -> n
+          | _ -> Typed.math_bits
+        in
+        let conj =
+          List.init
+            (i2 - i1 + 1)
+            (fun d ->
+              let i = i1 + d in
+              let iv =
+                Core_value.Obj (Int (Typed.BitVec.mk_masked width (Z.of_int i)))
+              in
+              eval_annot (add x iv subst) body |> Core_value.cast_bool
+              |> of_opt_not_impl)
+        in
+        Core_value.Bool
+          (List.fold_left
+             (fun acc b -> Typed.Bool.and_ acc b)
+             Typed.v_true conj)
   | RecordMember (record, memb) ->
       let record =
         match eval_annot subst record with

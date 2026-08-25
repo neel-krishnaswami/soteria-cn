@@ -38,6 +38,19 @@ module Adt = struct
         match (desc_of_bt k, desc_of_bt v) with
         | Some k, Some v -> Some (DMap (k, v))
         | _ -> None)
+    | Record fields ->
+        let rec go acc = function
+          | [] -> Some (List.rev acc)
+          | (id, bt) :: rest -> (
+              match desc_of_bt bt with
+              | Some d -> go ((Cn.Id.get_string id, d) :: acc) rest
+              | None -> None)
+        in
+        Option.map
+          (fun fs ->
+            let _name = Adt_ext.register_record fs in
+            Adt_ext.DRecord fs)
+          (go [] fields)
     | _ -> None
 
   (** Register every datatype of the program in the extension registry. *)

@@ -55,14 +55,25 @@ let execute_statement (subst : Subst.t) (stmt : Mu.cn_statement) :
       let*^ idx = Subst.eval_annot subst index_it in
       let* facts = InterpM.lift_sm State.get_facts in
       InterpM.fold_list facts ~init:() ~f:(fun () (f : State.Facts.fact) ->
-          if not (Cn.BaseTypes.equal f.q_bt ibt) then InterpM.ok ()
-          else
-            let*^ b =
-              Subst.eval_annot (Subst.add f.q idx f.snapshot) f.body
-            in
-            match Core_value.cast_bool b with
-            | None -> InterpM.not_impl "instantiate: fact body is not a boolean"
-            | Some b -> InterpM.lift (Csymex.assume [ b ]))
+          match f with
+          | State.Facts.FIt { q; q_bt; body; snapshot } ->
+              if not (Cn.BaseTypes.equal q_bt ibt) then InterpM.ok ()
+              else
+                let*^ b = Subst.eval_annot (Subst.add q idx snapshot) body in
+                (match Core_value.cast_bool b with
+                | None ->
+                    InterpM.not_impl "instantiate: fact body is not a boolean"
+                | Some b -> InterpM.lift (Csymex.assume [ b ]))
+          | State.Facts.FClosure { q_bt; body } ->
+              if not (Cn.BaseTypes.equal q_bt ibt) then InterpM.ok ()
+              else
+                let* i =
+                  Core_value.cast_int idx
+                  |> InterpM.of_opt_not_impl
+                       ~msg:"instantiate: index is not an integer"
+                in
+                let*^ b = body i in
+                InterpM.lift (Csymex.assume [ b ]))
   | Mu.Extract (_attrs, to_extract, index_it) -> (
       let open InterpM.Syntax in
       let* target =
@@ -122,10 +133,30 @@ let execute_statement (subst : Subst.t) (stmt : Mu.cn_statement) :
                           let v = Subst.cv_of_desc cell_desc cell_sv in
                           InterpM.lift_sm
                             (State.produce_owned cell_ptr ty v))
-                  | QOwned (_, Uninit) ->
-                      InterpM.not_impl "extract from W<> each"
-                  | QPName _ ->
-                      InterpM.not_impl "extract from predicate each"
+                  | QOwned (ty, Uninit) ->
+                      let loc = Typed.Ptr.loc cell_ptr in
+                      let ofs = Typed.Ptr.ofs cell_ptr in
+                      let*^ len =
+                        Soteria_c_vendor.Layout.size_of_s
+                          (Cn.Sctypes.to_ctype ty)
+                      in
+                      InterpM.lift_sm (State.produce_uninit' loc ofs len)
+                  | QPName name -> (
+                      (* The cell is a folded predicate instance. *)
+                      match Core_value.cast_map c.out with
+                      | None -> InterpM.not_impl "extract: chunk out not a map"
+                      | Some m ->
+                          let cell_sv =
+                            Typed.map_get
+                              ~value_ty:(Subst.ty_of_desc cell_desc)
+                              m idx
+                          in
+                          let v = Subst.cv_of_desc cell_desc cell_sv in
+                          let*^ extra = c.iargs idx in
+                          InterpM.lift_sm
+                            (State.produce_pred name
+                               (Core_value.Obj (Ptr cell_ptr) :: extra)
+                               [ v ]))
                 in
                 let perm' i =
                   let open Csymex.Syntax in
