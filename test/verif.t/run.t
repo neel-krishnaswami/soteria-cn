@@ -2,7 +2,7 @@
   Verifying function min3...
   Successfully verified min3
   Verifying function min3_invalid_spec...
-  error: `Lfail (((V|1| <=s V|2|) && (V|3| <=s V|1|))) in min3_invalid_spec
+  error: `Lfail (((V|1| <=u V|2|) && (V|3| <=u V|1|))) in min3_invalid_spec
       --> min3.c:21:13
    19 |      
    20 | /    unsigned int min3_invalid_spec(unsigned int x, unsigned int y, unsigned int z)

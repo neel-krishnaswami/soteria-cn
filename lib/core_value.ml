@@ -112,11 +112,11 @@ let rec obj_of_mem mv : obj or_unspec =
       Spec (Struct { tag; members }))
     (fun _tag _id _mv -> L.failwith "Core_value: union mem value")
 
-(* [OVinteger] carries no type, so its width defaults to [int]. *)
+(* [OVinteger] is a Core mathematical integer, kept at [math_bits]. *)
 let rec obj_of_mu (ov : Mu.object_value) : obj =
   let open Mu in
   match ov with
-  | OVinteger iv -> Int (int_of_ival ~bits:Typed.c_int_bits iv)
+  | OVinteger iv -> Int (int_of_ival ~bits:Typed.math_bits iv)
   | OVfloating fv -> Float (float_of_fval fv)
   | OVarray lvs -> Array (List.map loaded_of_mu lvs)
   | OVstruct { tag; members } ->
@@ -341,8 +341,9 @@ let cast_adt (v : t) : Typed.T_adt.sadt Typed.t option =
 let cast_map (v : t) : Typed.T_map.smap Typed.t option =
   match v with Map m -> Some m | _ -> None
 
+(* A Core mathematical integer (at [math_bits]). *)
 let c_int (i : int) : t =
-  Obj (Int (Typed.BitVec.mk_masked Typed.c_int_bits (Z.of_int i)))
+  Obj (Int (Typed.BitVec.mk_masked Typed.math_bits (Z.of_int i)))
 
 let c_int_of_bool b = if b then c_int 1 else c_int 0
 

@@ -11,6 +11,11 @@ let c_int_bits =
        (Signed Int_))
   * 8
 
+(* Width of the embedding of Core's mathematical integers: one sign bit more
+   than the widest C integer type, so every C integer value embeds
+   order-preservingly (signed) and no conversion loses information. *)
+let math_bits = ptr_bits + 1
+
 let t_loc = t_loc ptr_bits
 let t_ptr = t_ptr ptr_bits
 let t_usize = t_int ptr_bits

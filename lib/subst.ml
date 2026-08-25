@@ -142,13 +142,17 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
   | Binop (op, t1, t2) -> (
       let v1 = eval_annot subst t1 in
       let v2 = eval_annot subst t2 in
-      (* FIXME(signedness): this should come from the operand types
-         ([Bits (Unsigned, _)] -> false), but the C-side interpreter
-         ([Minterp.eval_op]) currently compares signed unconditionally; using
-         the correct signedness here makes spec obligations and body path
-         conditions disagree on unsigned programs (e.g. min3.c). Keep the two
-         sides consistent until Minterp threads C types through comparisons. *)
-      let signed = true in
+      (* Signedness comes from the operands' base type, as in CN. (The C-side
+         interpreter is consistent: it compares Core mathematical integers,
+         which embed C values order-preservingly.) *)
+      let signed =
+        let (IT (_, bt1, _)) = t1 in
+        match bt1 with
+        | Cn.BaseTypes.Bits (Unsigned, _) -> false
+        | Cn.BaseTypes.Bits (Signed, _) -> true
+        | Cn.BaseTypes.Loc _ -> false
+        | _ -> true
+      in
       let ints () =
         ( Core_value.cast_int v1 |> of_opt_not_impl,
           Core_value.cast_int v2 |> of_opt_not_impl )

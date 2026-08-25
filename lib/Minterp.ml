@@ -72,28 +72,87 @@ let malloc_failure_case () =
         ok (Core_value.Loaded (Spec (Ptr ptr))));
     ]
 
+let int_ty_of_ctype ~what (ty : CF.Ctype.ctype) :
+    CF.Ctype.integerType InterpM.t =
+  match ty with
+  | Ctype (_, Basic (Integer int_ty)) -> ok int_ty
+  | _ ->
+      not_impl "%s: type argument is not an integer type: %a" what Mu.pp_ctype
+        ty
+
+(* [v] is in the range of [ity], seen at [v]'s (signed) width. *)
+let in_ity_range (ity : CF.Ctype.integerType) (v : Typed.(T.sint t)) :
+    Typed.(T.sbool t) =
+  let width =
+    match Typed.get_ty v with
+    | TBitVector s -> s
+    | _ -> L.failwith "in_ity_range: not a bitvector"
+  in
+  let bits = Core_value.bits_of_ity ity in
+  let signed = Layout.is_int_ty_signed ity in
+  let lo = if signed then Z.neg (Z.shift_left Z.one (bits - 1)) else Z.zero in
+  let hi =
+    if signed then Z.pred (Z.shift_left Z.one (bits - 1))
+    else Z.pred (Z.shift_left Z.one bits)
+  in
+  let lo = Typed.BitVec.mk_masked width lo in
+  let hi = Typed.BitVec.mk_masked width hi in
+  Typed.Bool.and_
+    (Typed.BitVec.leq ~signed:true lo v)
+    (Typed.BitVec.leq ~signed:true v hi)
+
+(* Core's [conv_int]: embed a loaded C value of integer type [ty] into Core's
+   mathematical integers ([math_bits] wide), order-preservingly. *)
 let conv_int ~(ty : CF.Ctype.ctype) v : Typed.(T.sint t) InterpM.t =
-  let open Typed.Syntax in
   let open Typed.Infix in
   let* i = CV.cast_int v in
-  let* int_ty =
-    match ty with
-    | Ctype (_, Basic (Integer int_ty)) -> ok int_ty
-    | _ ->
-        not_impl "conv_int: type argument is not an integer type: %a"
-          Mu.pp_ctype ty
-  in
+  let* int_ty = int_ty_of_ctype ~what:"conv_int" ty in
   let+ current_size =
     match Typed.get_ty i with
     | TBitVector s -> ok s
     | _ -> not_impl "conv_int: value is not a bitvector: %a" Core_value.pp v
   in
   match int_ty with
-  | Bool -> Typed.ite (i ==@ Typed.BitVec.zero current_size) CInt.(0s) CInt.(1s)
+  | Bool ->
+      Typed.ite
+        (i ==@ Typed.BitVec.zero current_size)
+        (Typed.BitVec.mk_masked Typed.math_bits Z.zero)
+        (Typed.BitVec.mk_masked Typed.math_bits Z.one)
   | ity ->
-      let new_size = Core_value.bits_of_ity ity in
       let signed = Layout.is_int_ty_signed ity in
-      Typed.BitVec.fit_to ~signed new_size i
+      Typed.BitVec.fit_to ~signed Typed.math_bits i
+
+(* Core's [conv_loaded_int]: convert a mathematical integer back to a loaded C
+   value of type [ty]. Following CN's [check_conv_int]: _Bool tests against 0,
+   unsigned types wrap, and a signed target must be provable in range. *)
+let conv_loaded_int ~(ty : CF.Ctype.ctype) v : Typed.(T.sint t) InterpM.t =
+  let open Typed.Infix in
+  let* i = CV.cast_int v in
+  let* int_ty = int_ty_of_ctype ~what:"conv_loaded_int" ty in
+  let* current_size =
+    match Typed.get_ty i with
+    | TBitVector s -> ok s
+    | _ ->
+        not_impl "conv_loaded_int: value is not a bitvector: %a" Core_value.pp
+          v
+  in
+  match int_ty with
+  | Bool ->
+      let bits = Core_value.bits_of_ity Bool in
+      ok
+        (Typed.ite
+           (i ==@ Typed.BitVec.zero current_size)
+           (Typed.BitVec.mk_masked bits Z.zero)
+           (Typed.BitVec.mk_masked bits Z.one))
+  | ity ->
+      let bits = Core_value.bits_of_ity ity in
+      let signed = Layout.is_int_ty_signed ity in
+      if not signed then ok (Typed.BitVec.fit_to ~signed:false bits i)
+      else
+        if%sat Typed.Bool.not (in_ity_range ity i) then
+          (* CN reports an unrepresentable-integer error here. *)
+          error `Overflow
+        else ok (Typed.BitVec.fit_to ~signed:true bits i)
 
 let eval_ctor (ctor : CF.Core.ctor) (vs : Core_value.t list) :
     Core_value.t InterpM.t =
@@ -127,30 +186,32 @@ let exec_spec ~subst (arguments : arguments) (return_type : return_type) :
   let v = Subst.find (fst return_type.ret) subst in
   v
 
-let eval_iop ~(wrapping : bool) (iop : CF.Core.iop) (lhs : Typed.(T.sint t))
-    (rhs : Typed.(T.sint t)) : Typed.(T.sint t) InterpM.t =
-  let open Typed.Infix in
-  let arith_op ~check_signed_ovf ~checked_op ~unchecked_op =
-    if not wrapping then
-      if%sat check_signed_ovf lhs rhs then error `Overflow
-      else ok (checked_op lhs rhs)
-    else ok (unchecked_op lhs rhs)
+(* [PEwrapI]/[PEcatch_exceptional_condition]: mirror CN by computing in a
+   width where the operation cannot wrap ([2*bits + 4], like CN's [large_bt]),
+   then either wrapping to [int_ty] (wrapI) or erroring when the exact result
+   is outside [int_ty]'s range (catch_exceptional_condition). Operands and
+   result are mathematical integers ([math_bits] wide). *)
+let eval_iop ~(int_ty : CF.Ctype.integerType) ~(wrapping : bool)
+    (iop : CF.Core.iop) (lhs : Typed.(T.sint t)) (rhs : Typed.(T.sint t)) :
+    Typed.(T.sint t) InterpM.t =
+  let bits = Core_value.bits_of_ity int_ty in
+  let signed = Layout.is_int_ty_signed int_ty in
+  let big = max Typed.math_bits ((2 * bits) + 4) in
+  let l = Typed.BitVec.fit_to ~signed:true big lhs in
+  let r = Typed.BitVec.fit_to ~signed:true big rhs in
+  let* res =
+    match iop with
+    | IOpAdd -> ok (Typed.cast (Typed.BitVec.add l r))
+    | IOpSub -> ok (Typed.cast (Typed.BitVec.sub l r))
+    | IOpMul -> ok (Typed.cast (Typed.BitVec.mul l r))
+    | _ -> not_impl "unsupported iop"
   in
-  match iop with
-  | IOpAdd ->
-      arith_op
-        ~check_signed_ovf:(Typed.BitVec.add_overflows ~signed:true)
-        ~checked_op:( +!!@ ) ~unchecked_op:( +!@ )
-  | IOpSub ->
-      arith_op
-        ~check_signed_ovf:(Typed.BitVec.sub_overflows ~signed:true)
-        ~checked_op:( -!!@ ) ~unchecked_op:( -!@ )
-  | IOpMul ->
-      arith_op
-        ~check_signed_ovf:(Typed.BitVec.mul_overflows ~signed:true)
-        ~checked_op:(fun a b -> Typed.cast (Typed.BitVec.mul a b))
-        ~unchecked_op:(fun a b -> Typed.cast (Typed.BitVec.mul a b))
-  | _ -> not_impl "unsupported iop"
+  if wrapping then
+    let wrapped = Typed.BitVec.fit_to ~signed:false bits res in
+    ok (Typed.BitVec.fit_to ~signed Typed.math_bits wrapped)
+  else
+    if%sat Typed.Bool.not (in_ity_range int_ty res) then error `Overflow
+    else ok (Typed.BitVec.fit_to ~signed:true Typed.math_bits res)
 
 let cfunction (v : Core_value.t) =
   let* sym =
@@ -190,7 +251,8 @@ let eval_op (op : CF.Core.binop) (lhs : Core_value.t) (rhs : Core_value.t) =
   | OpEq -> ok (Bool (sem_eq lhs rhs))
   | OpOr -> ok @@ Core_value.Bool.or_ lhs rhs
   | OpLt ->
-      (* FIXME: I think this is wrong depending on signedness of values? We'd need to pass types here, as in Soteria C. *)
+      (* Operands are mathematical integers ([math_bits]-wide, order-preserving
+         signed embedding), so a signed comparison is always correct. *)
       ok @@ Core_value.lt ~signed:true lhs rhs
   | OpLe -> ok @@ Core_value.leq ~signed:true lhs rhs
   | OpGt -> ok @@ Core_value.lt ~signed:true rhs lhs
@@ -239,8 +301,8 @@ and eval_call ~loc (sym : Sym.t) (args : Core_value.t list) :
   | Symbol (_, _, SD_Id "conv_loaded_int"), [ ty; i ] -> (
       let* ty = CV.cast_type ty in
       match i with
-      | Loaded (Spec _) ->
-          let+ i = conv_int ~ty i in
+      | Loaded (Spec _) | Obj (Int _) ->
+          let+ i = conv_loaded_int ~ty i in
           Core_value.Loaded (Spec (Int i))
       | Loaded Unspec -> ok (Core_value.Loaded Unspec)
       | _ -> L.failwith "Invalid input to conv_loaded_int")
@@ -308,19 +370,19 @@ and eval_pexpr (subst : Subst.t) (pexpr : pexpr) =
       let* v = eval_pexpr subst value in
       let*^ subst = Subst.assign_pattern subst pat v in
       eval_pexpr subst body
-  | PEcatch_exceptional_condition { int_ty = _; iop; lhs; rhs } ->
+  | PEcatch_exceptional_condition { int_ty; iop; lhs; rhs } ->
       let* lhs = eval_pexpr subst lhs in
       let* rhs = eval_pexpr subst rhs in
       let* lhs = CV.cast_int lhs in
       let* rhs = CV.cast_int rhs in
-      let+ res = eval_iop ~wrapping:false iop lhs rhs in
+      let+ res = eval_iop ~int_ty ~wrapping:false iop lhs rhs in
       Core_value.Obj (Core_value.Int res)
-  | PEwrapI { int_ty = _; iop; lhs; rhs } ->
+  | PEwrapI { int_ty; iop; lhs; rhs } ->
       let* lhs = eval_pexpr subst lhs in
       let* rhs = eval_pexpr subst rhs in
       let* lhs = CV.cast_int lhs in
       let* rhs = CV.cast_int rhs in
-      let+ res = eval_iop ~wrapping:true iop lhs rhs in
+      let+ res = eval_iop ~int_ty ~wrapping:true iop lhs rhs in
       Core_value.Obj (Core_value.Int res)
   | PEnot e ->
       let+ b = eval_pexpr subst e in
@@ -352,7 +414,7 @@ and eval_pexpr (subst : Subst.t) (pexpr : pexpr) =
       let* ty = CV.cast_type ty in
       match i with
       | Loaded (Spec _) | Obj (Int _) ->
-          let+ i = conv_int ~ty i in
+          let+ i = conv_loaded_int ~ty i in
           Core_value.(Obj (Int i))
       | Loaded Unspec -> ok (Core_value.Loaded Unspec)
       | _ -> L.failwith "Invalid input to conv_int %a" Core_value.pp i)
