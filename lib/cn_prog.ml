@@ -24,7 +24,12 @@ let eval_lc (subst : Subst.t) (lc : Cn.LogicalConstraints.t) :
       let*^ b = Subst.eval_annot subst it in
       Core_value.cast_bool b
       |> InterpM.of_opt_not_impl ~msg:"eval_lc: not a boolean"
-  | Forall _ -> InterpM.not_impl "eval_lc: Forall"
+  | Forall ((q, q_bt), body) ->
+      let open InterpM.Syntax in
+      let*^ skolem = Core_value.nondet_bt q_bt in
+      let*^ b = Subst.eval_annot (Subst.add q skolem subst) body in
+      Core_value.cast_bool b
+      |> InterpM.of_opt_not_impl ~msg:"eval_lc: forall body is not a boolean"
 
 let execute_statement (subst : Subst.t) (stmt : Mu.cn_statement) :
     unit InterpM.t =
@@ -40,8 +45,96 @@ let execute_statement (subst : Subst.t) (stmt : Mu.cn_statement) :
   | Mu.Pack_unpack _ -> InterpM.not_impl "cn statement: pack/unpack"
   | Mu.To_from_bytes _ -> InterpM.not_impl "cn statement: to/from bytes"
   | Mu.Have _ -> InterpM.not_impl "cn statement: have"
-  | Mu.Instantiate _ -> InterpM.not_impl "cn statement: instantiate"
-  | Mu.Extract _ -> InterpM.not_impl "cn statement: extract"
+  | Mu.Instantiate (_filter, index_it) ->
+      (* Assume [body[q := index]] for every stored quantified fact whose bound
+         variable has the index's sort. CN filters which facts to instantiate
+         ([I_Function]/[I_Good]); instantiating more facts than CN is sound
+         (they are all assumptions), so the filter is ignored. *)
+      let open InterpM.Syntax in
+      let (Cn.Terms.IT (_, ibt, _)) = index_it in
+      let*^ idx = Subst.eval_annot subst index_it in
+      let* facts = InterpM.lift_sm State.get_facts in
+      InterpM.fold_list facts ~init:() ~f:(fun () (f : State.Facts.fact) ->
+          if not (Cn.BaseTypes.equal f.q_bt ibt) then InterpM.ok ()
+          else
+            let*^ b =
+              Subst.eval_annot (Subst.add f.q idx f.snapshot) f.body
+            in
+            match Core_value.cast_bool b with
+            | None -> InterpM.not_impl "instantiate: fact body is not a boolean"
+            | Some b -> InterpM.lift (Csymex.assume [ b ]))
+  | Mu.Extract (_attrs, to_extract, index_it) -> (
+      let open InterpM.Syntax in
+      let* target =
+        match to_extract with
+        | Cerb_frontend.Cn.E_Pred (CN_owned (Some ct))
+        | Cerb_frontend.Cn.E_Pred (CN_block (Some ct)) ->
+            InterpM.ok (State.Movable.MOwned ct)
+        | E_Pred (CN_named pn) -> InterpM.ok (State.Movable.MPred pn)
+        | _ -> InterpM.not_impl "extract: requires a C-type annotation"
+      in
+      let*^ idxv = Subst.eval_annot subst index_it in
+      let* idx =
+        Core_value.cast_int idxv
+        |> InterpM.of_opt_not_impl ~msg:"extract: index is not an integer"
+      in
+      let* () = InterpM.lift_sm (State.add_movable (target, idx)) in
+      (* Immediate extraction from held chunks (CN's add_movable_index ->
+         do_unfold_resources sequence): move the cell at [idx] from a covering
+         Q chunk into the heap, and weaken the chunk's permission. *)
+      let* qpreds = InterpM.lift_sm State.get_qpreds in
+      let rec extract_pass acc = function
+        | [] -> InterpM.lift_sm (State.set_qpreds (List.rev acc))
+        | (c : State.Qpreds.chunk) :: rest ->
+            if not (State.Movable.matches target c.qname) then
+              extract_pass (c :: acc) rest
+            else
+              let*^ covered =
+                let open Csymex.Syntax in
+                let* b = c.perm idx in
+                if%sure b then Csymex.return true else Csymex.return false
+              in
+              if not covered then extract_pass (c :: acc) rest
+              else
+                let*^ cell_desc =
+                  Cn_assert.cell_desc_of_qname c.qname
+                  |> Csymex.of_opt_not_impl ~msg:"extract: cell sort"
+                in
+                let*^ step_size =
+                  Soteria_c_vendor.Layout.size_of_s
+                    (Cn.Sctypes.to_ctype c.step)
+                in
+                let cell_ptr =
+                  Typed.Ptr.add_ofs c.pointer
+                    (Typed.cast (Typed.BitVec.mul idx step_size))
+                in
+                let* () =
+                  match c.qname with
+                  | QOwned (ty, Mu.Request.Init) -> (
+                      match Core_value.cast_map c.out with
+                      | None -> InterpM.not_impl "extract: chunk out not a map"
+                      | Some m ->
+                          let cell_sv =
+                            Typed.map_get
+                              ~value_ty:(Subst.ty_of_desc cell_desc)
+                              m idx
+                          in
+                          let v = Subst.cv_of_desc cell_desc cell_sv in
+                          InterpM.lift_sm
+                            (State.produce_owned cell_ptr ty v))
+                  | QOwned (_, Uninit) ->
+                      InterpM.not_impl "extract from W<> each"
+                  | QPName _ ->
+                      InterpM.not_impl "extract from predicate each"
+                in
+                let perm' i =
+                  let open Csymex.Syntax in
+                  let+ b = c.perm i in
+                  Typed.Bool.and_ b Typed.(not (Typed.Infix.( ==@ ) i idx))
+                in
+                extract_pass ({ c with perm = perm' } :: acc) rest
+      in
+      extract_pass [] qpreds)
   | Mu.Unfold (fsym, arg_annots) -> (
       match Ctx.get_fun_def fsym with
       | None -> InterpM.not_impl "unfold: unknown function"

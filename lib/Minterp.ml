@@ -332,7 +332,16 @@ and eval_pexpr (subst : Subst.t) (pexpr : pexpr) =
   | PEmemop _ -> not_impl "PEmemop"
   | PEconstrained _ -> not_impl "PEconstrainted"
   | PEerror _ -> not_impl "PEerror"
-  | PEarray_shift _ -> not_impl "PEarray_shift"
+  | PEarray_shift { base; ty; index } ->
+      let* base_v = eval_pexpr subst base in
+      let* bptr = CV.cast_ptr base_v in
+      let* idx_v = eval_pexpr subst index in
+      let* idx = CV.cast_int idx_v in
+      let*^ size = Layout.size_of_s (Cn.Sctypes.to_ctype ty) in
+      let idx = Typed.BitVec.fit_to ~signed:true Typed.ptr_bits idx in
+      ok
+        (Core_value.Obj
+           (Ptr (Typed.Ptr.add_ofs bptr (Typed.cast (Typed.BitVec.mul idx size)))))
   | PEstruct _ -> not_impl "PEstruct"
   | PEunion _ -> not_impl "PEunion"
   | PEmemberof _ -> not_impl "PEmemberof"

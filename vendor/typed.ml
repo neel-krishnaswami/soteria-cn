@@ -104,3 +104,25 @@ let adt_sel ~adt ~con ~field ~(field_ty : 'b ty) (v : [> T_adt.sadt ] t) : 'b t
 
 let fn_app ~fn ~(ret_ty : 'a ty) (args : Svalue.t list) : 'a t =
   mk_adt ret_ty (Adt_ext.App { fn; args })
+
+module T_map = struct
+  type smap = [ `Map ]
+end
+
+let t_map k v : [> T_map.smap ] ty =
+  Soteria.Bv_values.Svalue.TExtension (Adt_ext.TMap (k, v))
+
+(* [value_ty] is the sort of the map's values (result of a get); descs give
+   the map's own sort. *)
+let map_get ~(value_ty : 'a ty) (m : [> T_map.smap ] t) (k : Svalue.t) : 'a t =
+  mk_adt value_ty (Adt_ext.MapGet { m; k })
+
+let map_set ~key ~value (m : [> T_map.smap ] t) (k : Svalue.t) (v : Svalue.t) :
+    [> T_map.smap ] t =
+  mk_adt (t_map key value) (Adt_ext.MapSet { m; k; v })
+
+let map_const ~key ~value (v : Svalue.t) : [> T_map.smap ] t =
+  mk_adt (t_map key value) (Adt_ext.MapConst { key; value; v })
+
+let map_default ~key ~value : [> T_map.smap ] t =
+  mk_adt (t_map key value) (Adt_ext.MapDefault (key, value))

@@ -10,6 +10,7 @@ open Soteria_c_helpers
 module Producer = Producer_monad
 module Consumer = Consumer_monad
 module Sym = Soteria_c_vendor.Symbol_std
+module LSubst = Subst
 
 type term = Cn.(BaseTypes.t Terms.term)
 type annot = Cn.(BaseTypes.t Terms.annot)
@@ -17,6 +18,181 @@ type annot = Cn.(BaseTypes.t Terms.annot)
 let pp_okind ft = function
   | Mu.Request.Init -> Fmt.pf ft "Init"
   | Uninit -> Fmt.pf ft "Uninit"
+
+(* ───────────────────────── each() helpers ───────────────────────── *)
+
+module AE = Soteria_c_vendor.Adt_ext
+
+let index_width (q_bt : Cn.BaseTypes.t) : int option =
+  match q_bt with Bits (_, n) -> Some n | _ -> None
+
+(** Close a permission IT into a {!State.Qpreds.perm} closure. *)
+let perm_closure ~qsym ~(q_bt : Cn.BaseTypes.t) (it : annot) (close : Subst.t)
+    : State.Qpreds.perm =
+ fun i ->
+  let open Csymex.Syntax in
+  let* iv =
+    match q_bt with
+    | Cn.BaseTypes.Bits _ -> Csymex.return (Core_value.Obj (Int i))
+    | _ -> Csymex.not_impl "each: non-bitvector index sort"
+  in
+  let* v = Subst.eval_annot (Subst.add qsym iv close) it in
+  match Core_value.cast_bool v with
+  | Some b -> Csymex.return b
+  | None -> Csymex.not_impl "each: permission is not a boolean"
+
+(** [true] iff [f i] is provable for an arbitrary (fresh, unconstrained) [i] —
+    a sound forall-check by skolemization. *)
+let csym_holds_forall ~width (f : State.Qpreds.perm) : bool Csymex.t =
+  let open Csymex.Syntax in
+  let* i = Csymex.nondet (Typed.t_int width) in
+  let* b = f i in
+  if%sure b then Csymex.return true else Csymex.return false
+
+let qname_equal (a : Mu.Request.QPredicate.name)
+    (b : Mu.Request.QPredicate.name) =
+  match (a, b) with
+  | QOwned (ty1, Mu.Request.Init), QOwned (ty2, Mu.Request.Init)
+  | QOwned (ty1, Uninit), QOwned (ty2, Uninit) ->
+      Cn.Sctypes.equal ty1 ty2
+  | QPName s1, QPName s2 -> Sym.equal s1 s2
+  | _ -> false
+
+let cell_desc_of_qname (qname : Mu.Request.QPredicate.name) :
+    AE.sort_desc option =
+  match qname with
+  | QOwned (ty, _) -> Soteria_c_helpers.Adt.desc_of_bt (Cn.Memory.bt_of_sct ty)
+  | QPName _ -> None
+
+(** The port of CN's [qpredicate_request]: consume an [each] footprint from the
+    movable-index cells and the held Q chunks, and assemble the map output. *)
+let consume_qpred ~(qname : Mu.Request.QPredicate.name)
+    ~(ptr : Typed.T.sptr Typed.t) ~(q_bt : Cn.BaseTypes.t)
+    ~(step : Cn.Sctypes.t) ~(needed : State.Qpreds.perm) :
+    (Core_value.t, _, State.syn list) State.SM.Result.t =
+  let open State.SM in
+  let open State.SM.Syntax in
+  let*^ width =
+    index_width q_bt |> Csymex.of_opt_not_impl ~msg:"each: index width"
+  in
+  let*^ step_size = Layout.size_of_s (Cn.Sctypes.to_ctype step) in
+  let*^ cell_desc =
+    cell_desc_of_qname qname
+    |> Csymex.of_opt_not_impl ~msg:"each: unsupported cell sort"
+  in
+  let key_desc = AE.DBits width in
+  let cell_ptr k =
+    Typed.Ptr.add_ofs ptr (Typed.cast (Typed.BitVec.mul k step_size))
+  in
+  (* Phase 1: extraction at movable indices (CN's One cases). *)
+  let* movable = State.get_movable in
+  let rec extract_loop needed ones = function
+    | [] -> Result.ok (needed, ones)
+    | (target, k) :: rest ->
+        if not (State.Movable.matches target qname) then
+          extract_loop needed ones rest
+        else
+          let*^ take =
+            let open Csymex.Syntax in
+            let* b = needed k in
+            if%sure b then Csymex.return true else Csymex.return false
+          in
+          if not take then extract_loop needed ones rest
+          else
+            let** v =
+              match qname with
+              | QOwned (ty, Mu.Request.Init) ->
+                  State.with_base (State.SState.consume_owned (cell_ptr k) ty)
+              | QOwned (ty, Uninit) ->
+                  State.with_base (State.SState.consume_uninit (cell_ptr k) ty)
+              | QPName _ ->
+                  lift @@ Csymex.not_impl "each over user-defined predicates"
+            in
+            let*^ vsv =
+              Subst.sv_of_cv cell_desc v
+              |> Csymex.of_opt_not_impl ~msg:"each: cell sort mismatch"
+            in
+            let needed' i =
+              let open Csymex.Syntax in
+              let+ b = needed i in
+              Typed.Bool.and_ b Typed.(not (Typed.Infix.( ==@ ) i k))
+            in
+            extract_loop needed' ((k, vsv) :: ones) rest
+  in
+  let** needed, ones = extract_loop needed [] movable in
+  (* Phase 2: transfer from a held Q chunk covering the (narrowed) remainder. *)
+  let* qpreds = State.get_qpreds in
+  let rec find_chunk acc = function
+    | [] -> Csymex.return (None, List.rev acc)
+    | (c : State.Qpreds.chunk) :: rest ->
+        let open Csymex.Syntax in
+        if not (qname_equal c.qname qname && Cn.Sctypes.equal c.step step) then
+          find_chunk (c :: acc) rest
+        else
+          let* peq =
+            if%sure Typed.Infix.( ==@ ) ptr c.pointer then Csymex.return true
+            else Csymex.return false
+          in
+          if not peq then find_chunk (c :: acc) rest
+          else
+            let* covered =
+              csym_holds_forall ~width (fun i ->
+                  let* nb = needed i in
+                  let+ ab = c.perm i in
+                  Typed.Bool.or_ (Typed.not nb) ab)
+            in
+            if not covered then find_chunk (c :: acc) rest
+            else Csymex.return (Some c, List.rev_append acc rest)
+  in
+  let*^ chunk, others = find_chunk [] qpreds in
+  let** base, needed =
+    match chunk with
+    | Some c ->
+        let residual i =
+          let open Csymex.Syntax in
+          let* ab = c.perm i in
+          let+ nb = needed i in
+          Typed.Bool.and_ ab (Typed.not nb)
+        in
+        let*^ res_empty =
+          csym_holds_forall ~width (fun i ->
+              let open Csymex.Syntax in
+              let+ b = residual i in
+              Typed.not b)
+        in
+        let qpreds' =
+          if res_empty then others else { c with perm = residual } :: others
+        in
+        let* () = State.set_qpreds qpreds' in
+        Result.ok (Some c.out, fun _ -> Csymex.return Typed.v_false)
+    | None -> Result.ok (None, needed)
+  in
+  (* Phase 3: remainder check. *)
+  let*^ done_ =
+    csym_holds_forall ~width (fun i ->
+        let open Csymex.Syntax in
+        let+ b = needed i in
+        Typed.not b)
+  in
+  if not done_ then
+    Result.miss_no_fix ~reason:"each: footprint not fully available" ()
+  else
+    (* Phase 4: assemble the output map (CN's cases_to_map). *)
+    let** base_map =
+      match base with
+      | Some out -> (
+          match Core_value.cast_map out with
+          | Some m -> Result.ok m
+          | None -> lift @@ Csymex.not_impl "each: chunk output is not a map")
+      | None ->
+          Result.ok (Typed.map_default ~key:key_desc ~value:cell_desc)
+    in
+    let out =
+      List.fold_left
+        (fun m (k, v) -> Typed.map_set ~key:key_desc ~value:cell_desc m k v)
+        base_map ones
+    in
+    Result.ok (Core_value.Map out)
 
 let subst_for_pred_def (def : Mu.predicate_def) iargs =
   (* Both [def.iargs] and [iargs] lead with the pointer, so they line up. *)
@@ -79,7 +255,14 @@ and produce_logical_constraint (lc : Cn.LogicalConstraints.t) : unit Producer.t
     =
   match lc with
   | T it -> produce_pure it
-  | Forall _ -> Producer.lift @@ not_impl "consume_logical_constraint: Forall"
+  | Forall ((q, q_bt), body) ->
+      (* CN's quantifier-free discipline: quantified assumptions are never sent
+         to the solver; they are stored (with the current substitution closing
+         their free spec variables) and used by [instantiate]. *)
+      let open Producer.With_syntax in
+      let* snapshot = Producer.get_state () in
+      Producer.lift_state
+        (State.add_fact { q; q_bt; body; snapshot })
 
 and produce_clause (clause : Mu.clause) =
   let open Producer.With_syntax in
@@ -153,7 +336,23 @@ and produce_resource (req : Mu.Request.t) (ty : Cn.BaseTypes.t) :
   match req with
   | Owned { ty = cty; kind; ptr } -> produce_owned_resource ~cty ~kind ~ptr ty
   | P { name; iargs } -> produce_predicate name iargs
-  | Q _ -> Producer.lift @@ not_impl "produce_resource: Q"
+  | Q qp ->
+      let open Producer.With_syntax in
+      let* pv = Subst.eval_annot qp.pointer in
+      let*^ ptr =
+        Core_value.cast_ptr pv
+        |> of_opt_not_impl ~msg:"each: pointer is not a pointer"
+      in
+      let* snapshot = Producer.get_state () in
+      let qsym, q_bt = qp.q in
+      let perm = perm_closure ~qsym ~q_bt qp.permission snapshot in
+      let*^ out = Core_value.nondet_bt ty in
+      let+ () =
+        Producer.lift_state
+          (State.add_qpred
+             { qname = qp.name; pointer = ptr; q_bt; step = qp.step; perm; out })
+      in
+      out
 
 and produce_logical_arg ((arg, loc) : Mu.logical_arg * Cn.Locations.info) :
     unit Producer.t =
@@ -225,7 +424,20 @@ let consume_logical_constraint (lc : Cn.LogicalConstraints.t) : unit Consumer.t
     =
   match lc with
   | T it -> consume_pure it
-  | Forall _ -> Consumer.not_impl "consume_logical_constraint: Forall"
+  | Forall ((q, q_bt), body) ->
+      (* Sound forall-introduction: prove the body for a fresh, unconstrained
+         skolem variable. *)
+      let open Consumer.With_syntax in
+      let (IT (_, _, loc)) = body in
+      let@ () = Consumer.with_loc ~loc in
+      let*^ skolem = Core_value.nondet_bt q_bt in
+      let* subst = Consumer.get_subst () in
+      let*^ v = LSubst.eval_annot (LSubst.add q skolem subst) body in
+      let*^ v =
+        Core_value.cast_bool v
+        |> of_opt_not_impl ~msg:"forall body is not a boolean"
+      in
+      logic_assert v
 
 let consume_owned_pred cty (kind : Mu.Request.init) ptr :
     Core_value.t Consumer.t =
@@ -313,7 +525,17 @@ and consume_resource (req : Mu.Request.t) : Core_value.t Consumer.t =
   | P { name; iargs } ->
       let* (iargs : Core_value.t list) = map_list ~f:Subst.eval_annot iargs in
       lift_state @@ consume_predicate name iargs
-  | Q _ -> Consumer.not_impl "consume_resource: Q"
+  | Q qp ->
+      let* pv = Subst.eval_annot qp.pointer in
+      let*^ ptr =
+        Core_value.cast_ptr pv
+        |> of_opt_not_impl ~msg:"each: pointer is not a pointer"
+      in
+      let* subst = Consumer.get_subst () in
+      let qsym, q_bt = qp.q in
+      let needed = perm_closure ~qsym ~q_bt qp.permission subst in
+      lift_state @@ State.lift_consumer_error
+      @@ consume_qpred ~qname:qp.name ~ptr ~q_bt ~step:qp.step ~needed
 
 and consume_logical_arg ((arg, (loc, _)) : Mu.logical_arg * Cn.Locations.info) :
     unit Consumer.t =

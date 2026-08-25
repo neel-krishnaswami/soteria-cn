@@ -44,8 +44,18 @@ module Request = struct
     (** A user-defined predicate request; [iargs] leads with the pointer. *)
   end
 
-  (* Quantified ("each") requests aren't reworked yet: kept as CN's own type. *)
-  module QPredicate = Cn.Request.QPredicate
+  module QPredicate = struct
+    type name = QOwned of Sctypes.t * init | QPName of Sym.t
+
+    type t = {
+      name : name;
+      pointer : IndexTerms.t;
+      q : Sym.t * BaseTypes.t;  (** the bound index variable *)
+      step : Sctypes.t;  (** element stride, as a C type *)
+      permission : IndexTerms.t;  (** guard over the index variable *)
+      iargs : IndexTerms.t list;
+    }
+  end
 
   (* [Owned] points-to resources are their own request kind, with the pointer
      and pointee type explicit, rather than an [Owned] resource name whose
@@ -66,11 +76,19 @@ module Request = struct
       Fmt.(list ~sep:comma pp_it)
       p.iargs
 
+  let pp_qname ft = function
+    | QPredicate.QOwned (ty, Init) -> Fmt.pf ft "RW<%a>" pp_sct ty
+    | QPredicate.QOwned (ty, Uninit) -> Fmt.pf ft "W<%a>" pp_sct ty
+    | QPredicate.QPName s -> Sym.pp_hum ft s
+
   let pp ?no_nums ft = function
     | Owned { ty; kind; ptr } ->
         Fmt.pf ft "@[<2>%a<%a>(%a)@]" pp_kind kind pp_sct ty pp_it ptr
     | P p -> pp_predicate ?no_nums ft p
-    | Q q -> pprint (fun q -> Cn.Request.pp_aux (Cn.Request.Q q) None) ft q
+    | Q (q : QPredicate.t) ->
+        Fmt.pf ft "@[<2>each (%a; %a)@ %a(%a + %a * step)@]" Sym.pp_hum
+          (fst q.q) pp_it q.permission pp_qname q.name pp_it q.pointer
+          Sym.pp_hum (fst q.q)
 end
 
 (* ───────────────────────────── AST ───────────────────────────── *)
@@ -1060,9 +1078,24 @@ module Of_mucore = struct
         Owned { ty; kind = request_init init; ptr = p.pointer }
     | PName name -> P { name; iargs = p.pointer :: p.iargs }
 
+  let qpredicate (q : Cn.Request.QPredicate.t) : Request.QPredicate.t =
+    let name =
+      match q.name with
+      | Owned (ty, init) -> Request.QPredicate.QOwned (ty, request_init init)
+      | PName s -> QPName s
+    in
+    {
+      name;
+      pointer = q.pointer;
+      q = q.q;
+      step = q.step;
+      permission = q.permission;
+      iargs = q.iargs;
+    }
+
   let request : Cn.Request.t -> Request.t = function
     | P p -> request_predicate p
-    | Q q -> Q q
+    | Q q -> Q (qpredicate q)
 
   let request_resource ((req, bt) : Cn.Request.t * BaseTypes.t) :
       Request.t * BaseTypes.t =

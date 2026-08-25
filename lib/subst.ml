@@ -87,6 +87,7 @@ let sv_of_cv (desc : AE.sort_desc) (v : Core_value.t) : Typed.Svalue.t option =
   | DBits _ -> Core_value.cast_int v
   | DPtr _ | DLoc _ -> Core_value.cast_ptr v
   | DAdt _ -> Core_value.cast_adt v
+  | DMap _ -> Core_value.cast_map v
 
 let cv_of_desc (desc : AE.sort_desc) (sv : Typed.Svalue.t) : Core_value.t =
   match desc with
@@ -94,6 +95,7 @@ let cv_of_desc (desc : AE.sort_desc) (sv : Typed.Svalue.t) : Core_value.t =
   | DBits _ -> Obj (Int sv)
   | DPtr _ | DLoc _ -> Obj (Ptr sv)
   | DAdt _ -> Adt sv
+  | DMap _ -> Map sv
 
 let ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
   match desc with
@@ -102,6 +104,7 @@ let ty_of_desc (desc : AE.sort_desc) : Typed.Svalue.ty =
   | DPtr n -> Soteria.Bv_values.Svalue.TPointer n
   | DLoc n -> Soteria.Bv_values.Svalue.TLoc n
   | DAdt a -> Typed.t_adt a
+  | DMap (k, v) -> Typed.t_map k v
 
 let ite_val ~of_opt_not_impl ~fail g (b1 : Core_value.t) (b2 : Core_value.t) :
     Core_value.t =
@@ -249,6 +252,30 @@ let rec eval_annot (subst : t) (annot : annot) : Core_value.t =
   | Good (_, _) ->
       (* Are those pointer invariants? I don't think it should be separate from the chunk? *)
       Core_value.true_
+  | MapGet (m_t, k_t) -> (
+      let (IT (_, mbt, _)) = m_t in
+      match HAdt.desc_of_bt mbt with
+      | Some (AE.DMap (kd, vd)) ->
+          let m = eval_annot subst m_t |> Core_value.cast_map |> of_opt_not_impl in
+          let k = eval_annot subst k_t |> sv_of_cv kd |> of_opt_not_impl in
+          cv_of_desc vd (Typed.map_get ~value_ty:(ty_of_desc vd) m k)
+      | _ -> not_impl ())
+  | MapSet (m_t, k_t, v_t) -> (
+      let (IT (_, mbt, _)) = m_t in
+      match HAdt.desc_of_bt mbt with
+      | Some (AE.DMap (kd, vd)) ->
+          let m = eval_annot subst m_t |> Core_value.cast_map |> of_opt_not_impl in
+          let k = eval_annot subst k_t |> sv_of_cv kd |> of_opt_not_impl in
+          let v = eval_annot subst v_t |> sv_of_cv vd |> of_opt_not_impl in
+          Core_value.Map (Typed.map_set ~key:kd ~value:vd m k v)
+      | _ -> not_impl ())
+  | MapConst (kbt, v_t) -> (
+      let (IT (_, vbt, _)) = v_t in
+      match (HAdt.desc_of_bt kbt, HAdt.desc_of_bt vbt) with
+      | Some kd, Some vd ->
+          let v = eval_annot subst v_t |> sv_of_cv vd |> of_opt_not_impl in
+          Core_value.Map (Typed.map_const ~key:kd ~value:vd v)
+      | _ -> not_impl ())
   | Constructor (con_sym, field_annots) -> (
       let adt =
         match _bt with

@@ -28,12 +28,16 @@ module Adt = struct
   let adt_name (sym : Symbol_std.t) : string =
     Fmt.str "%a" Symbol_std.pp_hum sym
 
-  let desc_of_bt (bt : Cn.BaseTypes.t) : Adt_ext.sort_desc option =
+  let rec desc_of_bt (bt : Cn.BaseTypes.t) : Adt_ext.sort_desc option =
     match bt with
     | Bool -> Some DBool
     | Bits (_, n) -> Some (DBits n)
     | Loc () -> Some (DPtr Typed.ptr_bits)
     | Datatype s -> Some (DAdt (adt_name s))
+    | Map (k, v) -> (
+        match (desc_of_bt k, desc_of_bt v) with
+        | Some k, Some v -> Some (DMap (k, v))
+        | _ -> None)
     | _ -> None
 
   (** Register every datatype of the program in the extension registry. *)

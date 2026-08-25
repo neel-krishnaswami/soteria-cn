@@ -29,6 +29,7 @@ type t =
   | Record of (Id.t * t) list
   | Bool of T.sbool Typed.t
   | Adt of Typed.T_adt.sadt Typed.t
+  | Map of Typed.T_map.smap Typed.t
 
 (* A specified value prints as [Spec(...)] and an unspecified one as [Unspec],
    so that a [Loaded] value stays distinguishable from a raw [Obj]. *)
@@ -60,6 +61,7 @@ let rec pp ft (v : t) =
       Fmt.pf ft "@[<hov 2>{%a}@]" Fmt.(list ~sep:semi pp_field) fields
   | Bool b -> Typed.ppa ft b
   | Adt v -> Typed.ppa ft v
+  | Map v -> Typed.ppa ft v
 
 let show = Fmt.to_to_string pp
 let true_ = Bool Typed.v_true
@@ -170,6 +172,17 @@ let rec nondet_bt (bt : Cn.BaseTypes.t) : t Csymex.t =
         Csymex.nondet (Typed.t_adt (Soteria_c_helpers.Adt.adt_name sym))
       in
       Adt v
+  | Map (kbt, vbt) -> (
+      match
+        ( Soteria_c_helpers.Adt.desc_of_bt kbt,
+          Soteria_c_helpers.Adt.desc_of_bt vbt )
+      with
+      | Some k, Some v ->
+          let+ m = Csymex.nondet (Typed.t_map k v) in
+          Map m
+      | _ ->
+          Fmt.kstr Soteria_c_helpers.not_impl "nondet_bt: unsupported map %a"
+            Mu.pp_bt bt)
   | Struct sym ->
       let prog = Ctx.get_prog () in
       let layout =
@@ -252,7 +265,7 @@ let to_agv (v : t) : Aggregate_val.t =
   match v with
   | Obj o -> obj_to_agv o
   | Loaded o -> loaded_to_agv o
-  | Type _ | Unit | List _ | Tuple _ | Bool _ | Record _ | Adt _ ->
+  | Type _ | Unit | List _ | Tuple _ | Bool _ | Record _ | Adt _ | Map _ ->
       L.failwith "Core_value.to_agv: not an aggregate value: %a" pp v
 
 (* The runtime type of a [Basic] aggregate value tells us which scalar [obj] it
@@ -324,6 +337,9 @@ let cast_bool (v : t) : T.sbool Typed.t option =
 
 let cast_adt (v : t) : Typed.T_adt.sadt Typed.t option =
   match v with Adt a -> Some a | _ -> None
+
+let cast_map (v : t) : Typed.T_map.smap Typed.t option =
+  match v with Map m -> Some m | _ -> None
 
 let c_int (i : int) : t =
   Obj (Int (Typed.BitVec.mk_masked Typed.c_int_bits (Z.of_int i)))
@@ -435,6 +451,7 @@ let rec sem_eq v1 v2 =
   | Tuple t1, Tuple t2 -> sem_eq_list t1 t2
   | Bool b1, Bool b2 -> b1 ==@ b2
   | Adt a1, Adt a2 -> a1 ==@ a2
+  | Map m1, Map m2 -> m1 ==@ m2
   | _ -> Typed.v_false
 
 module Syntax = struct
@@ -481,6 +498,7 @@ module Syn = struct
     | Record fields -> List.iter (fun (_, v) -> iter_vars v f) fields
     | Bool b -> Typed.Svalue.iter_vars (Typed.Expr.of_value b) f
     | Adt v -> Typed.Svalue.iter_vars (Typed.Expr.of_value v) f
+    | Map v -> Typed.Svalue.iter_vars (Typed.Expr.of_value v) f
     | Type _ | Unit -> ()
 end
 

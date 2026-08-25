@@ -16,6 +16,7 @@ type sort_desc =
   | DPtr of int  (** pointer sort of the given bit width *)
   | DLoc of int
   | DAdt of string
+  | DMap of sort_desc * sort_desc
 
 type con_def = { con : string; fields : (string * sort_desc) list }
 type adt_def = { adt : string; cons : con_def list }
@@ -55,6 +56,14 @@ let field_sort adt con field =
 
 let sel_name adt con field = Printf.sprintf "%s.%s.%s" adt con field
 
+let rec sort_mangle = function
+  | DBool -> "bool"
+  | DBits n -> Printf.sprintf "bv%d" n
+  | DPtr n -> Printf.sprintf "ptr%d" n
+  | DLoc n -> Printf.sprintf "loc%d" n
+  | DAdt s -> s
+  | DMap (k, v) -> Printf.sprintf "map.%s.%s" (sort_mangle k) (sort_mangle v)
+
 (* ─────────────────────── the value extension ─────────────────────── *)
 
 type 'g t =
@@ -72,13 +81,41 @@ type 'g t =
     }
 
   | App of { fn : string; args : ('g, 'g t, 'g ty) Svalue.t list }
+  | MapGet of { m : ('g, 'g t, 'g ty) Svalue.t; k : ('g, 'g t, 'g ty) Svalue.t }
+  | MapSet of {
+      m : ('g, 'g t, 'g ty) Svalue.t;
+      k : ('g, 'g t, 'g ty) Svalue.t;
+      v : ('g, 'g t, 'g ty) Svalue.t;
+    }
+  | MapConst of {
+      key : sort_desc;
+      value : sort_desc;
+      v : ('g, 'g t, 'g ty) Svalue.t;
+    }
+  | MapDefault of sort_desc * sort_desc
 
-and 'g ty = TAdt of string
+and 'g ty = TAdt of string | TMap of sort_desc * sort_desc
 
-let equal_ty _ (TAdt a) (TAdt b) = String.equal a b
-let compare_ty _ (TAdt a) (TAdt b) = String.compare a b
-let hash_ty (TAdt a) = Hashtbl.hash a
-let pp_ty ft (TAdt a) = Fmt.string ft a
+let equal_ty _ a b =
+  match (a, b) with
+  | TAdt a, TAdt b -> String.equal a b
+  | TMap (k1, v1), TMap (k2, v2) -> k1 = k2 && v1 = v2
+  | _ -> false
+
+let compare_ty _ a b =
+  match (a, b) with
+  | TAdt a, TAdt b -> String.compare a b
+  | TMap (k1, v1), TMap (k2, v2) -> Stdlib.compare (k1, v1) (k2, v2)
+  | TAdt _, TMap _ -> -1
+  | TMap _, TAdt _ -> 1
+
+let hash_ty = function
+  | TAdt a -> Hashtbl.hash a
+  | TMap (k, v) -> Hashtbl.hash (k, v)
+
+let pp_ty ft = function
+  | TAdt a -> Fmt.string ft a
+  | TMap (k, v) -> Fmt.pf ft "map<%s,%s>" (sort_mangle k) (sort_mangle v)
 let tag (sv : _ Svalue.t) = sv.Hc.tag
 
 let equal _ x y =
@@ -95,10 +132,28 @@ let equal _ x y =
   | App a, App b ->
       String.equal a.fn b.fn
       && List.equal (fun l r -> Int.equal (tag l) (tag r)) a.args b.args
+  | MapGet a, MapGet b ->
+      Int.equal (tag a.m) (tag b.m) && Int.equal (tag a.k) (tag b.k)
+  | MapSet a, MapSet b ->
+      Int.equal (tag a.m) (tag b.m)
+      && Int.equal (tag a.k) (tag b.k)
+      && Int.equal (tag a.v) (tag b.v)
+  | MapConst a, MapConst b ->
+      a.key = b.key && a.value = b.value && Int.equal (tag a.v) (tag b.v)
+  | MapDefault (k1, v1), MapDefault (k2, v2) -> k1 = k2 && v1 = v2
   | _ -> false
 
 let compare _ x y =
-  let int_of = function Constr _ -> 0 | Tester _ -> 1 | Sel _ -> 2 | App _ -> 3 in
+  let int_of = function
+    | Constr _ -> 0
+    | Tester _ -> 1
+    | Sel _ -> 2
+    | App _ -> 3
+    | MapGet _ -> 4
+    | MapSet _ -> 5
+    | MapConst _ -> 6
+    | MapDefault _ -> 7
+  in
   match (x, y) with
   | Constr a, Constr b ->
       let c = String.compare a.adt b.adt in
@@ -123,6 +178,20 @@ let compare _ x y =
       let c = String.compare a.fn b.fn in
       if c <> 0 then c
       else List.compare (fun l r -> Int.compare (tag l) (tag r)) a.args b.args
+  | MapGet a, MapGet b ->
+      let c = Int.compare (tag a.m) (tag b.m) in
+      if c <> 0 then c else Int.compare (tag a.k) (tag b.k)
+  | MapSet a, MapSet b ->
+      let c = Int.compare (tag a.m) (tag b.m) in
+      if c <> 0 then c
+      else
+        let c = Int.compare (tag a.k) (tag b.k) in
+        if c <> 0 then c else Int.compare (tag a.v) (tag b.v)
+  | MapConst a, MapConst b ->
+      let c = Stdlib.compare (a.key, a.value) (b.key, b.value) in
+      if c <> 0 then c else Int.compare (tag a.v) (tag b.v)
+  | MapDefault (k1, v1), MapDefault (k2, v2) ->
+      Stdlib.compare (k1, v1) (k2, v2)
   | _ -> Int.compare (int_of x) (int_of y)
 
 let hash x =
@@ -132,6 +201,10 @@ let hash x =
   | Tester { con; v } -> Hashtbl.hash (1, con, tag v)
   | Sel { adt; con; field; v } -> Hashtbl.hash (2, adt, con, field, tag v)
   | App { fn; args } -> Hashtbl.hash (3, fn, List.map tag args)
+  | MapGet { m; k } -> Hashtbl.hash (4, tag m, tag k)
+  | MapSet { m; k; v } -> Hashtbl.hash (5, tag m, tag k, tag v)
+  | MapConst { key; value; v } -> Hashtbl.hash (6, key, value, tag v)
+  | MapDefault (k, v) -> Hashtbl.hash (7, k, v)
 
 let pp pp_super ft x =
   match x with
@@ -142,11 +215,26 @@ let pp pp_super ft x =
       Fmt.pf ft "@[<2>%a.%s.%s@]" pp_super v con field
   | App { fn; args } ->
       Fmt.pf ft "@[<2>%s(%a)@]" fn (Fmt.list ~sep:Fmt.comma pp_super) args
+  | MapGet { m; k } -> Fmt.pf ft "@[<2>%a[%a]@]" pp_super m pp_super k
+  | MapSet { m; k; v } ->
+      Fmt.pf ft "@[<2>%a[%a :=@ %a]@]" pp_super m pp_super k pp_super v
+  | MapConst { v; _ } -> Fmt.pf ft "@[<2>const(%a)@]" pp_super v
+  | MapDefault (k, v) ->
+      Fmt.pf ft "default<%s,%s>" (sort_mangle k) (sort_mangle v)
 
 let iter_vars f x =
   match x with
   | Constr { args; _ } | App { args; _ } -> List.iter f args
   | Tester { v; _ } | Sel { v; _ } -> f v
+  | MapGet { m; k } ->
+      f m;
+      f k
+  | MapSet { m; k; v } ->
+      f m;
+      f k;
+      f v
+  | MapConst { v; _ } -> f v
+  | MapDefault _ -> ()
 
 (** Smart constructor: selector-of-constructor projects; tester-of-constructor
     concretises. *)
@@ -165,7 +253,15 @@ let mk build ty x =
       | Svalue.Extension (Constr { con = con'; _ }) ->
           build (Svalue.Bool (String.equal con con')) Svalue.TBool
       | _ -> build (Svalue.Extension x) ty)
-  | Constr _ | App _ -> build (Svalue.Extension x) ty
+  | MapGet { m; k } -> (
+      match m.Hc.node.Svalue.kind with
+      | Svalue.Extension (MapSet { k = k'; v; _ })
+        when Int.equal (tag k) (tag k') ->
+          v
+      | Svalue.Extension (MapConst { v; _ }) -> v
+      | _ -> build (Svalue.Extension x) ty)
+  | Constr _ | App _ | MapSet _ | MapConst _ | MapDefault _ ->
+      build (Svalue.Extension x) ty
 
 let eval f x =
   let map_args args =
@@ -188,6 +284,16 @@ let eval f x =
   | Sel s ->
       let v = f s.v in
       if v == s.v then x else Sel { s with v }
+  | MapGet g ->
+      let m = f g.m and k = f g.k in
+      if m == g.m && k == g.k then x else MapGet { m; k }
+  | MapSet ms ->
+      let m = f ms.m and k = f ms.k and v = f ms.v in
+      if m == ms.m && k == ms.k && v == ms.v then x else MapSet { m; k; v }
+  | MapConst c ->
+      let v = f c.v in
+      if v == c.v then x else MapConst { c with v }
+  | MapDefault _ -> x
 
 let apply_subst sub ~missing_var st x =
   let sub_args st args =
@@ -213,6 +319,19 @@ let apply_subst sub ~missing_var st x =
   | Sel s ->
       let v, st = sub ~missing_var st s.v in
       (Sel { s with v }, st)
+  | MapGet g ->
+      let m, st = sub ~missing_var st g.m in
+      let k, st = sub ~missing_var st g.k in
+      (MapGet { m; k }, st)
+  | MapSet ms ->
+      let m, st = sub ~missing_var st ms.m in
+      let k, st = sub ~missing_var st ms.k in
+      let v, st = sub ~missing_var st ms.v in
+      (MapSet { m; k; v }, st)
+  | MapConst c ->
+      let v, st = sub ~missing_var st c.v in
+      (MapConst { c with v }, st)
+  | MapDefault _ -> (x, st)
 
 (* ─────────────────────────── SMT encoding ─────────────────────────── *)
 
@@ -242,13 +361,15 @@ let declare_group (enc_sort : sort_desc -> Smt.sexp) : Smt.sexp =
       Smt.List (List.map per_adt defs);
     ]
 
-let enc_sort_with (enc : 'g ty Svalue.ty -> Smt.sexp) : sort_desc -> Smt.sexp =
-  function
+let rec enc_sort_with (enc : 'g ty Svalue.ty -> Smt.sexp) :
+    sort_desc -> Smt.sexp = function
   | DBool -> enc Svalue.TBool
   | DBits n -> enc (Svalue.TBitVector n)
   | DPtr n -> enc (Svalue.TPointer n)
   | DLoc n -> enc (Svalue.TLoc n)
   | DAdt s -> Smt.Atom s
+  | DMap (k, v) ->
+      Smt.List [ Smt.Atom "Array"; enc_sort_with enc k; enc_sort_with enc v ]
 
 (* The datatype group must be declared before ANY use of an ADT sort or
    constructor/selector/tester/function symbol — including ground terms whose
@@ -258,10 +379,11 @@ let declare_adts (enc : 'g ty Svalue.ty -> Smt.sexp) : unit =
     Decls.declare ~key:adts_key (fun yield ->
         yield (declare_group (enc_sort_with enc)))
 
-let encode_ty (enc : 'g ty Svalue.ty -> Smt.sexp) (TAdt name : 'g ty) :
-    Smt.sexp =
+let encode_ty (enc : 'g ty Svalue.ty -> Smt.sexp) (ty : 'g ty) : Smt.sexp =
   declare_adts enc;
-  Smt.Atom name
+  match ty with
+  | TAdt name -> Smt.Atom name
+  | TMap (k, v) -> enc_sort_with enc (DMap (k, v))
 
 let encode_value (enc_ty : 'g ty Svalue.ty -> Smt.sexp)
     (enc : ('g, 'g t, 'g ty) Svalue.t -> Smt.sexp) ~ty:_ (x : 'g t) : Smt.sexp
@@ -272,6 +394,22 @@ let encode_value (enc_ty : 'g ty Svalue.ty -> Smt.sexp)
   | Constr { con; args; _ } -> app_ con (List.map enc args)
   | Tester { con; v } -> app (fam "is" [ Atom con ]) [ enc v ]
   | Sel { adt; con; field; v } -> app_ (sel_name adt con field) [ enc v ]
+  | MapGet { m; k } -> app_ "select" [ enc m; enc k ]
+  | MapSet { m; k; v } -> app_ "store" [ enc m; enc k; enc v ]
+  | MapConst { key; value; v } ->
+      app
+        (List
+           [
+             Atom "as";
+             Atom "const";
+             enc_sort_with enc_ty (DMap (key, value));
+           ])
+        [ enc v ]
+  | MapDefault (k, v) ->
+      let name = "cn-default." ^ sort_mangle (DMap (k, v)) in
+      Decls.declare ~key:name (fun yield ->
+          yield (declare name (enc_sort_with enc_ty (DMap (k, v)))));
+      Atom name
   | App { fn; args } ->
       (match find_fun fn with
       | Some { arg_sorts; ret_sort; _ } ->
