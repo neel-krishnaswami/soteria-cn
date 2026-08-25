@@ -84,7 +84,35 @@ let execute_statement (subst : Subst.t) (stmt : Mu.cn_statement) :
                   in
                   InterpM.lift
                     (Csymex.assume [ Core_value.sem_eq lhs rhs ]))))
-  | Mu.Apply _ -> InterpM.not_impl "cn statement: apply"
+  | Mu.Apply (lsym, arg_annots) -> (
+      match Ctx.get_lemma lsym with
+      | None -> InterpM.not_impl "apply: unknown lemma"
+      | Some (loc, (args, ensures)) ->
+          let open InterpM.Syntax in
+          InterpM.with_extra_call_trace ~loc
+            ~msg:(Fmt.str "Applying lemma %a" Symbol_std.pp_hum lsym)
+          @@ (* Bind the lemma's computational/ghost binders to the evaluated
+                argument terms, then run the spine: consume the requires,
+                produce the ensures. *)
+          let*^ lemma_subst =
+            let open Csymex.Syntax in
+            match List.combine args.comp arg_annots with
+            | exception Invalid_argument _ ->
+                Csymex.not_impl "apply: wrong number of arguments"
+            | pairs ->
+                Csymex.fold_list pairs ~init:Subst.empty
+                  ~f:(fun acc ((barg, _info), annot) ->
+                    let (Mu.Computational (bsym, _) | Mu.Ghost (bsym, _)) =
+                      barg
+                    in
+                    let+ v = Subst.eval_annot subst annot in
+                    Subst.add bsym v acc)
+          in
+          let* (), lemma_subst = Cn_assert.consume_arguments args lemma_subst in
+          let+ _subst =
+            Cn_assert.produce_logical_return ~subst:lemma_subst ~loc ensures
+          in
+          ())
   | Mu.Inline _ -> InterpM.not_impl "cn statement: inline"
   | Mu.Print _ -> InterpM.not_impl "cn statement: print"
 

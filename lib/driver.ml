@@ -96,19 +96,86 @@ let show_mucore config c_config file =
   Fmt.pr "%a@.@?" Usable_mucore.pp_file umucore;
   Ok ()
 
+(* ── Rocq lemma-obligation export (reuses CN's Lemmata module) ── *)
+
+(* Build the slice of [Cn.Global.t] that [Cn.Lemmata.generate] reads
+   (struct_decls, datatypes(+constrs), resource predicates, logical
+   functions); the order fields and fun_decls are unused by it. *)
+let build_global (mu : unit Mucore.file) : Global.t =
+  let struct_decls =
+    Pmap.fold
+      (fun s (def : Mucore.tag_definition) acc ->
+        match def with
+        | StructDef l -> Sym.Map.add s l acc
+        | UnionDef -> acc)
+      mu.tagDefs Sym.Map.empty
+  in
+  let datatypes, datatype_constrs =
+    List.fold_left
+      (fun (dts, ctors) ((s, dt) : _ * Mucore.datatype) ->
+        let dts =
+          Sym.Map.add s
+            BaseTypes.Datatype.
+              {
+                constrs = List.map fst dt.cases;
+                all_params = List.concat_map snd dt.cases;
+              }
+            dts
+        in
+        let ctors =
+          List.fold_left
+            (fun ctors (c, params) ->
+              Sym.Map.add c BaseTypes.Datatype.{ params; datatype_tag = s } ctors)
+            ctors dt.cases
+        in
+        (dts, ctors))
+      (Sym.Map.empty, Sym.Map.empty)
+      mu.datatypes
+  in
+  let add_all xs m =
+    List.fold_left (fun m (s, v) -> Sym.Map.add s v m) m xs
+  in
+  {
+    Global.empty with
+    struct_decls;
+    datatypes;
+    datatype_constrs;
+    resource_predicates =
+      add_all mu.resource_predicates Global.empty.resource_predicates;
+    logical_functions = add_all mu.logical_predicates Sym.Map.empty;
+    lemmata = add_all mu.lemmata Sym.Map.empty;
+  }
+
+let generate_lemmata ~out (mu : unit Mucore.file) : (unit, string) Result.t =
+  (* [Lemmata.generate] raises [Failure] on lemmas whose coerced form it cannot
+     translate (upstream CN crashes identically, e.g. on resource lemmas whose
+     coercion introduces computational binders); fail cleanly instead. *)
+  match Lemmata.generate (build_global mu) out mu.lemmata with
+  | Ok () -> Ok ()
+  | Error err ->
+      TypeErrors.report_pretty err;
+      Error "lemmata generation failed"
+  | exception Failure msg -> Error ("lemmata generation failed: " ^ msg)
+
 (* Compositionally verify CN function specifications. [functions] optionally
    restricts verification to the named functions; an empty list verifies all. *)
-let verify (config : Soteria.Config.t) c_config fuel functions file =
+let verify (config : Soteria.Config.t) c_config fuel lemmata_out functions file
+    =
   let open Syntaxes.Result in
   let functions = match functions with [] -> None | l -> Some l in
   let* file = Option.to_result ~none:"No input file provided" file in
   let fuel = Soteria.Symex.Fuel_gauge.Cli.validate_or_exit fuel in
   let@ () = initialise ~soteria_config:config Compositional c_config in
-  let umucore =
+  let mucore_file =
     let@ () = Soteria.Stats.As_ctx.add_time_of_to "soteria-cn.parsing_time" in
-    let mucore_file = Frontend.load_mucore_ast file in
-    Usable_mucore.of_mucore mucore_file
+    Frontend.load_mucore_ast file
   in
+  let* () =
+    match lemmata_out with
+    | None -> Ok ()
+    | Some out -> generate_lemmata ~out mucore_file
+  in
+  let umucore = Usable_mucore.of_mucore mucore_file in
   let@ () =
     Soteria.Stats.As_ctx.add_time_of_to "soteria-cn.verification_time"
   in

@@ -12,7 +12,7 @@
          show-mucore [OPTION]… [FILE]
              Parse a program and display its Mucore representation.
   
-         verify [--function=FUNCTION] [OPTION]… [FILE]
+         verify [--function=FUNCTION] [--lemmata=FILE] [OPTION]… [FILE]
              Verify each (non-trusted) function of a program against its CN
              specification.
   
@@ -40,7 +40,8 @@
          against its CN specification.
   
   SYNOPSIS
-         soteria-cn verify [--function=FUNCTION] [OPTION]… [FILE]
+         soteria-cn verify [--function=FUNCTION] [--lemmata=FILE] [OPTION]…
+         [FILE]
   
   SOLVER OPTIONS
          --dump-smt-to=VAL, --dump-smt=VAL
@@ -170,6 +171,10 @@
              Restrict verification to the function named FUNCTION. May be given
              several times to verify a list of functions. If omitted, every
              (non-trusted) function is verified.
+  
+         --lemmata=FILE
+             Generate Rocq lemma proof obligations into FILE (same format as
+             CN's --lemmata; prove them against the cn-coq library).
   
   COMMON OPTIONS
          --help[=FMT] (default=auto)

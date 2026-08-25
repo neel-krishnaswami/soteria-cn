@@ -36,6 +36,14 @@ end
 module Verify = struct
   let file_arg = Arg.(value & pos 0 (some file) None & info ~docv:"FILE" [])
 
+  let lemmata_arg =
+    let doc =
+      "Generate Rocq lemma proof obligations into $(docv) (same format as \
+       CN's --lemmata; prove them against the cn-coq library)."
+    in
+    Arg.(
+      value & opt (some string) None & info [ "lemmata" ] ~docv:"FILE" ~doc)
+
   let functions_arg =
     let doc =
       "Restrict verification to the function named $(docv). May be given \
@@ -52,7 +60,7 @@ module Verify = struct
       $ Soteria_c_vendor.Config.cmdliner_term ()
       $ Soteria.Symex.Fuel_gauge.Cli.term
           ~default:Soteria.Symex.Fuel_gauge.infinite ()
-      $ functions_arg $ file_arg)
+      $ lemmata_arg $ functions_arg $ file_arg)
 
   let cmd =
     Cmd.v

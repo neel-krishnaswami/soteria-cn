@@ -197,6 +197,19 @@ let produce_return_type ~subst (ret_ty : Mu.return_type) :
   let+ (), subst = Producer.run_with_subst ~subst producer in
   Compo_res.Ok subst
 
+(** Produce a lemma's [ensures] (a logical return type with no return
+    binder). Mirror of {!produce_return_type}. *)
+let produce_logical_return ~subst ~loc (lrt : Mu.logical_return) :
+    (Subst.t, _, _) State.SM.Result.t =
+  let producer =
+    let open Producer.With_syntax in
+    let@ () = with_loc ~loc in
+    Producer.iter_list lrt ~f:produce_logical_arg
+  in
+  let open State.SM.Syntax in
+  let+ (), subst = Producer.run_with_subst ~subst producer in
+  Compo_res.Ok subst
+
 let consume_pure (annot : annot) : unit Consumer.t =
   let open Consumer.With_syntax in
   let (IT (_, _, loc)) = annot in
