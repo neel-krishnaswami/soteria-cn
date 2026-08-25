@@ -56,6 +56,10 @@ let add_umu_defs (umu : Usable_mucore.file) tbl : unit =
 
 let add_pred_defs (umu : Usable_mucore.file) tbl : unit =
   let open Cn.Definition.Predicate in
+  (* The built-in allocation-token predicate (uninterpreted: no clauses);
+     produced/consumed by loop-invariant argument types. *)
+  Hashtbl.add tbl Cn.Alloc.Predicate.sym
+    (Usable_mucore.Of_mucore.predicate_def Cn.Definition.alloc);
   List.iter (fun (sym, def) -> Hashtbl.add tbl sym def) umu.resource_predicates
 
 let add_fun_defs (umu : Usable_mucore.file) tbl : unit =

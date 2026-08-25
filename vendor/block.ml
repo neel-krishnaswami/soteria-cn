@@ -10,6 +10,13 @@ let pp_pretty ft t =
 let is_freed (t : ('a Freeable0.freeable, 'b) with_info) =
   [%matches? Freed] t.node
 
+(* Freed, or alive but owning no bytes (its ownership was consumed, e.g. by a
+   loop invariant): either way the block holds no resource. *)
+let owns_nothing (t : (Ctree_block.t Freeable0.freeable, 'b) with_info) =
+  match t.node with
+  | Freeable0.Freed -> true
+  | Freeable0.Alive ctb -> Ctree_block.owns_nothing ctb
+
 let alloc ?loc ~zeroed size =
   {
     node = Freeable0.Alive (Ctree_block.alloc ~zeroed size);

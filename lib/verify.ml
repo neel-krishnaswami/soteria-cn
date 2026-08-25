@@ -14,12 +14,20 @@ let with_extra_call_trace ~loc ~msg : 'a Csymex.t -> 'a Csymex.t =
   let elem = Soteria.Terminal.Call_trace.mk_element ~loc ~msg () in
   (e, elem :: tr)
 
-let verif_process ~loc (args : Mu.arguments) return_type labels body =
+let verif_process ~loc ?ghost_args ~(args : Mu.arguments) ~return_type ~labels
+    ~body () =
   let open Csymex in
   let open Syntax in
   let@@ () = with_extra_call_trace ~loc ~msg:"Verifying function" in
   [%l.debug "Producing pre-condition"];
-  let* subst, state = Cn_assert.produce_arguments args in
+  let* subst, state =
+    (* For a label obligation, first bring the enclosing function's binders and
+       pure constraints into scope (without its resources), as CN does. *)
+    match ghost_args with
+    | None -> Csymex.return (Subst.empty, State.empty)
+    | Some fargs -> Cn_assert.produce_arguments ~ghost_resources:true fargs
+  in
+  let* subst, state = Cn_assert.produce_arguments ~subst ~state args in
   [%l.debug
     "@[<v 2>About to execute function body with:@ @[<v 2>subst: %a@]@ @[<v \
      2>state: %a@]@]"
@@ -35,6 +43,11 @@ let verif_process ~loc (args : Mu.arguments) return_type labels body =
         [%l.error "Missing resource during function execution"];
         x)
   in
+  match result with
+  | Minterp.ExprM.Jumped ->
+      (* Invariant consumed and footprint checked empty at the jump. *)
+      Result.ok ()
+  | _ ->
   let ret = Minterp.ExprM.returned_value result in
   let** (), state =
     State.SM.Result.run_with_state ~state
@@ -91,8 +104,27 @@ let verify_fn ~fuel:_ ~loc (_name : Sym.t) args return_type labels body =
   [%l.debug
     "@[<v 2>Specifically within:@ ret: %a@ logic: %a@]" Mu.pp_bt
       (snd return_type.ret) Mu.pp_logical_return return_type.logic];
-  let process = verif_process ~loc args return_type labels body in
-  Csymex.Result.run ~fail_fast:true ~mode:OX ~stats:Caller process
+  let run process =
+    Csymex.Result.run ~fail_fast:true ~mode:OX ~stats:Caller process
+  in
+  let main =
+    run (verif_process ~loc ~args ~return_type ~labels ~body ())
+  in
+  (* Each loop label is its own obligation: produce its argument type (the
+     invariant) and verify its body under the same label context. *)
+  let label_obligations =
+    Sym.Map.fold
+      (fun _ def acc ->
+        match def with
+        | Mu.Loop { loc = lloc; args = largs; body = lbody; _ } ->
+            acc
+            @ run
+                (verif_process ~loc:lloc ~ghost_args:args ~args:largs
+                   ~return_type ~labels ~body:lbody ())
+        | Non_inlined _ | Return _ -> acc)
+      labels []
+  in
+  main @ label_obligations
 
 let name_of Cerb_frontend.Symbol.(Symbol (_, _, sd)) =
   match sd with SD_Id name -> name | _ -> ""

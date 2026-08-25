@@ -46,7 +46,10 @@ module SState = struct
       | Some { heap = Some heap; _ } ->
           Seq.filter_map
             (fun (_, (block : Block.t)) ->
-              if not (Block.is_freed block) then Some block.info else None)
+              (* CN's leak check is resource-emptiness: a block that owns no
+                 bytes (freed, or its ownership consumed by e.g. a loop
+                 invariant) is not a leak. *)
+              if not (Block.owns_nothing block) then Some block.info else None)
             (Heap.syntactic_bindings heap)
           |> List.of_seq
     in
@@ -150,12 +153,14 @@ let produce_pred name ins outs state =
 
 let consume_pred_inner name ins = with_preds (Uninterpreted.consume' name ins)
 
-let unfold_with_heuristics ~produce_def heuristics =
+let unfold_with_heuristics ~produce_def ?can_unfold heuristics =
   let open SM in
   let open Syntax in
   let* state = get_state () in
   let st = of_opt state in
-  match Uninterpreted.take_max_with_heurisitcs heuristics st.preds with
+  match
+    Uninterpreted.take_max_with_heurisitcs ?can_unfold heuristics st.preds
+  with
   | None ->
       [%l.debug "Heuristics failed to find any predicate to unfold."];
       return false
@@ -167,7 +172,7 @@ let unfold_with_heuristics ~produce_def heuristics =
       let+ () = set_state state in
       true
 
-let with_recovery_attempt ~produce_def ~heuristics
+let with_recovery_attempt ~produce_def ?can_unfold ~heuristics
     (f : ('a, 'err, syn list) SM.Result.t) : ('a, 'err, syn list) SM.Result.t =
   let open Csymex.Syntax in
   fun state ->
@@ -177,7 +182,7 @@ let with_recovery_attempt ~produce_def ~heuristics
     | Missing _ | Error _ -> (
         (* We give another attempt by finding a matching predicate to unfold *)
         let* could_unfold, state' =
-          unfold_with_heuristics ~produce_def heuristics first_state
+          unfold_with_heuristics ~produce_def ?can_unfold heuristics first_state
         in
         if not could_unfold then Csymex.return (first_res, first_state)
         else
@@ -267,6 +272,27 @@ let consume_uninit ptr ty =
   lift_consumer_error @@ with_base (SState.consume_uninit ptr ty)
 
 let consume_pred name ins = lift_consumer_error @@ consume_pred_inner name ins
+
+(** [Kill] of a stack variable: free the allocation when the pointer denotes a
+    real block; otherwise (ownership produced from a spec — e.g. in a
+    loop-label obligation — has no allocation bounds) consume the variable's
+    footprint, which is what CN's [Kill] does. *)
+let kill_static ptr ty : (unit, _, _) SM.Result.t =
+ fun state ->
+  let open Csymex.Syntax in
+  let* res, state' = with_miss_as_error (with_base (SState.free ptr)) state in
+  match res with
+  | Compo_res.Ok () -> Csymex.return (res, state')
+  | Error _ | Missing _ -> (
+      let* res2, state2 =
+        (lift_consumer_error @@ with_base (SState.consume_any ptr ty)) state
+      in
+      match res2 with
+      | Compo_res.Ok _ -> Csymex.return (Compo_res.Ok (), state2)
+      | Error _ | Missing _ ->
+          (* Report the failure of the [free] attempt. *)
+          Csymex.return (res, state'))
+
 let alloc_ty ty = with_miss_as_error @@ with_base (SState.alloc_ty ty)
 let alloc size = with_miss_as_error @@ with_base (SState.alloc size)
 let store ptr ty v = with_miss_as_error @@ with_base (SState.store ptr ty v)

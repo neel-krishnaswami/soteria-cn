@@ -11,21 +11,29 @@ open Mu
 module InterpM = Interp_monad
 
 module ExprM = struct
-  type 'a exec_r = Normal of 'a | Returned of Core_value.t
+  type 'a exec_r = Normal of 'a | Returned of Core_value.t | Jumped
   [@@deriving show { with_path = false }]
 
-  let returned_value = function Returned v -> v | Normal _ -> Core_value.Unit
+  let returned_value = function
+    | Returned v -> v
+    | Normal _ | Jumped -> Core_value.Unit
 
   type 'a t = 'a exec_r InterpM.t
 
   let bind (f : 'a -> 'b t) (m : 'a t) : 'b t =
     InterpM.bind
-      (function Normal x -> f x | Returned v -> InterpM.ok (Returned v))
+      (function
+        | Normal x -> f x
+        | Returned v -> InterpM.ok (Returned v)
+        | Jumped -> InterpM.ok Jumped)
       m
 
   let map (f : 'a -> 'b) (m : 'a t) : 'b t =
     InterpM.map
-      (function Normal x -> Normal (f x) | Returned v -> Returned v)
+      (function
+        | Normal x -> Normal (f x)
+        | Returned v -> Returned v
+        | Jumped -> Jumped)
       m
 
   let ok (x : 'a) : 'a t = InterpM.ok (Normal x)
@@ -185,6 +193,8 @@ let eval_op (op : CF.Core.binop) (lhs : Core_value.t) (rhs : Core_value.t) =
       (* FIXME: I think this is wrong depending on signedness of values? We'd need to pass types here, as in Soteria C. *)
       ok @@ Core_value.lt ~signed:true lhs rhs
   | OpLe -> ok @@ Core_value.leq ~signed:true lhs rhs
+  | OpGt -> ok @@ Core_value.lt ~signed:true rhs lhs
+  | OpGe -> ok @@ Core_value.leq ~signed:true rhs lhs
   | _ -> not_impl "eval_op: unsupported operator: %a" Mu.pp_binop op
 
 let rec eval_action (subst : Subst.t) (action : action) : Core_value.t InterpM.t
@@ -192,8 +202,16 @@ let rec eval_action (subst : Subst.t) (action : action) : Core_value.t InterpM.t
   let@ () = with_loc ~loc:action.loc in
   match action.action with
   | Create { align = _; ty; prefix = _ } ->
-      let+ ptr = State.alloc_ty ty.node in
-      Core_value.Obj (Ptr ptr)
+      let* ptr = State.alloc_ty ty.node in
+      let pv = Core_value.Obj (Ptr ptr) in
+      (* CN's [Create] also yields an allocation token, consumed by [Kill] and
+         by loop-invariant argument types. Its output (base/size record) is
+         left unconstrained. *)
+      let*^ out = Core_value.nondet_bt Cn.Alloc.History.value_bt in
+      let+ () =
+        lift_sm (SState.produce_pred Cn.Alloc.Predicate.sym [ pv ] [ out ])
+      in
+      pv
   | Store { ptr; value; ty; _ } ->
       let* ptr = eval_pexpr subst ptr in
       let* value = eval_pexpr subst value in
@@ -202,9 +220,16 @@ let rec eval_action (subst : Subst.t) (action : action) : Core_value.t InterpM.t
   | Load { ptr; ty; _ } ->
       let* ptr = eval_pexpr subst ptr in
       State.load ptr ty.node
-  | Kill (_kind, ptr) ->
+  | Kill (kind, ptr) ->
       let* ptr = eval_pexpr subst ptr in
-      let+ () = State.free ptr in
+      let* _out = SState.consume_pred Cn.Alloc.Predicate.sym [ ptr ] in
+      let+ () =
+        match kind with
+        | Static ct ->
+            let* tptr = CV.cast_ptr ptr in
+            SState.kill_static tptr ct
+        | Dynamic -> State.free ptr
+      in
       Core_value.Unit
   | _ -> not_impl "Unsupported action: %a" Mu.pp_action action
 
@@ -242,8 +267,16 @@ and eval_call ~loc (sym : Sym.t) (args : Core_value.t list) :
       InterpM.branches
         ([
            (fun () ->
-             let+ ptr = State.alloc size in
-             Core_value.Loaded (Spec (Ptr ptr)));
+             let* ptr = State.alloc size in
+             let pv = Core_value.Loaded (Spec (Ptr ptr)) in
+             (* Like CN's malloc spec, yield an allocation token so a later
+                [Kill Dyn] (free) stays balanced. *)
+             let*^ out = Core_value.nondet_bt Cn.Alloc.History.value_bt in
+             let+ () =
+               lift_sm
+                 (SState.produce_pred Cn.Alloc.Predicate.sym [ pv ] [ out ])
+             in
+             pv);
          ]
         @ malloc_failure_case ())
   | sym, args -> (
@@ -386,9 +419,31 @@ and eval_expr ~(labels : label_def Sym.Map.t) (subst : Subst.t) (body : expr) :
       | Return _, _ ->
           not_impl "Return label with multiple values: %a" Sym.pp_hum lab
       | Non_inlined _, _ -> not_impl "Non-inlined label: %a" Sym.pp_hum lab
-      | Loop { loc = _; args = _; body; annots = _; info = _ }, _vs ->
-          (* TODO: loop invariants etvc *)
-          eval_expr ~labels subst body)
+      | Loop { loc = lloc; args; body; annots = _; info = _ }, vs -> (
+          match Soteria_c_vendor.Config.current_mode () with
+          | Whole_program ->
+              (* Concrete execution: unroll. *)
+              eval_expr ~labels subst body
+          | Compositional -> (
+              (* CN discipline: jumping to a loop label consumes the label's
+                 argument type (the invariant, incl. the auto-generated
+                 ownership of locals), requires the remaining footprint to be
+                 empty, and ends the path. The label body is verified as a
+                 separate obligation (see [Verify.verify_fn]). *)
+              let@ () = with_loc ~loc:lloc in
+              (* Extend (not replace) the current substitution: the invariant
+                 may mention enclosing-scope variables (CN checks the spine in
+                 the full typing context). *)
+              let lsubst = Subst.from_args ~init:subst args vs in
+              let* (), _lsubst = Cn_assert.consume_arguments args lsubst in
+              let* state = get_state () in
+              match SState.leaks state with
+              | [] -> InterpM.ok ExprM.Jumped
+              | _ :: _ ->
+                  [%l.debug
+                    "Resources left over at loop back-edge (invariant must \
+                     capture the whole footprint)"];
+                  error `Memory_leak)))
   | Eif { cond; then_; else_ } ->
       let* guard = eval_pexpr subst cond in
       let* () = State.unfold_on_if_else guard in
@@ -433,4 +488,10 @@ and exec_fun (fn : Mu.fun_map_decl) params =
       else
         let+ v = eval_expr ~labels subst body in
         [%l.debug "Function returned: %a" (ExprM.pp_exec_r Core_value.pp) v];
-        match v with Normal _ -> Core_value.Unit | Returned v -> v)
+        match v with
+        | Normal _ -> Core_value.Unit
+        | Returned v -> v
+        | Jumped ->
+            (* Only possible for a spec-less inlined callee containing a loop;
+               CN requires a spec for such functions. *)
+            L.failwith "Inlined call ended at a loop back-edge")

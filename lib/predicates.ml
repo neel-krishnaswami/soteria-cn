@@ -52,18 +52,21 @@ module M (Symex : Symex.Base) = struct
 
     (** Removes the folded predicate with the highest score according to the
         heuristics. *)
-    let take_max_with_heurisitcs (heuristics : V.t unfold_heuristics)
-        (st : t option) : (pred * t option) option =
+    let take_max_with_heurisitcs ?(can_unfold = fun _ -> true)
+        (heuristics : V.t unfold_heuristics) (st : t option) :
+        (pred * t option) option =
       let open Syntaxes.Option in
       let st = of_opt st in
       let* idx, _score =
         Iter.foldi
-          (fun acc idx (_, ins, outs) ->
-            match (acc, heuristics ins outs) with
-            | None, Some score -> Some (idx, score)
-            | Some (_, score), Some score' when score < score' ->
-                Some (idx, score')
-            | _ -> acc)
+          (fun acc idx (name, ins, outs) ->
+            if not (can_unfold name) then acc
+            else
+              match (acc, heuristics ins outs) with
+              | None, Some score -> Some (idx, score)
+              | Some (_, score), Some score' when score < score' ->
+                  Some (idx, score')
+              | _ -> acc)
           None (Iter.of_list st)
       in
       let+ elem, rest = (try Some (List.take_nth_exn idx st) with Invalid_argument _ -> None) in

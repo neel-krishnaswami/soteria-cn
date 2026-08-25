@@ -257,13 +257,18 @@ let rec produce_def_s name ins outs =
   let out = List.hd outs in
   State.SM.assume [ Core_value.sem_eq res out ]
 
+(* Chunks of clause-less predicates (e.g. the built-in [Alloc] token) can
+   never be unfolded; keep the heuristics from picking them. *)
+and can_unfold name = Option.is_some (Ctx.get_pred_def name).clauses
+
 and unfold_with_heuristics heuristics =
-  State.unfold_with_heuristics ~produce_def:produce_def_s heuristics
+  State.unfold_with_heuristics ~produce_def:produce_def_s ~can_unfold
+    heuristics
 
 and with_recovery_attempt ~values f =
   State.with_recovery_attempt
     ~heuristics:(Unfold_heuristics.recovery_heuristics values)
-    ~produce_def:produce_def_s f
+    ~produce_def:produce_def_s ~can_unfold f
 
 and produce_logical_constraint (lc : Cn.LogicalConstraints.t) : unit Producer.t
     =
@@ -359,8 +364,9 @@ and produce_predicate (sym : Sym.t) (iargs : annot list) :
   let*^ v = Core_value.nondet_bt ret_ty in
   let* iargs = map_list ~f:Subst.eval_annot iargs in
   (* I think CN never produces non-recursive predicates?
-     So let's just unfold them *)
-  if def.recursive then
+     So let's just unfold them. Clause-less predicates (e.g. the built-in
+     [Alloc] token) can only exist folded. *)
+  if def.recursive || Option.is_none def.clauses then
     (* Cn predicates have a unique out-param. *)
     let+ () = lift_state @@ State.produce_pred sym iargs [ v ] in
     v
@@ -404,17 +410,39 @@ and produce_logical_arg ((arg, loc) : Mu.logical_arg * Cn.Locations.info) :
       Subst.add sym v
   | Constraint lc -> produce_logical_constraint lc
 
-let produce_arguments (args : Mu.arguments) :
+(** Like {!produce_logical_arg}, but resources only bind their output to a
+    fresh value instead of adding footprint. Used to bring a function's
+    binders and pure constraints into scope for label-body obligations, which
+    (as in CN's [check_procedure]) see the function's context but not its
+    resources. *)
+let produce_logical_arg_ghost ((arg, loc) : Mu.logical_arg * _) :
+    unit Producer.t =
+  let open Producer.With_syntax in
+  let@ () = with_loc ~loc:(fst loc) in
+  match arg with
+  | Define (sym, annot) ->
+      let* v = Subst.eval_annot annot in
+      Subst.add sym v
+  | Resource (sym, (_req, ty)) ->
+      let*^ v = Core_value.nondet_bt ty in
+      Subst.add sym v
+  | Constraint lc -> produce_logical_constraint lc
+
+let produce_arguments ?(ghost_resources = false) ?(subst = Subst.empty)
+    ?(state = State.empty) (args : Mu.arguments) :
     (Subst.t * State.t option) Csymex.t =
   (* [produce_computational_arg] threads [(subst, state)] over [Csymex] by hand;
      reshape it into a [Producer.t] (which threads [subst] over [State.SM]). *)
   let open Csymex.Syntax in
+  let produce_logical =
+    if ghost_resources then produce_logical_arg_ghost else produce_logical_arg
+  in
   let producer =
     let open Producer.With_syntax in
     let* () = iter_list ~f:produce_computational_arg args.comp in
-    iter_list ~f:produce_logical_arg args.logic
+    iter_list ~f:produce_logical args.logic
   in
-  let+ ((), subst), state = producer Subst.empty State.empty in
+  let+ ((), subst), state = producer subst state in
   (subst, state)
 
 (** Toplevel function made to be used in the interpreter *)
@@ -551,6 +579,9 @@ and consume_predicate sym iargs : (Core_value.t, _, _) State.SM.Result.t =
   (* If we failed to consume the predicate, we try to fold it instead *)
   match first_res with
   | Ok _ -> return first_res
+  | Error _ | Missing _ when Option.is_none (Ctx.get_pred_def sym).clauses ->
+      (* Clause-less predicates (e.g. [Alloc]) cannot be folded. *)
+      return first_res
   | Error _ | Missing _ -> (
       [%l.trace
         "Auto-fold attempt for %a(%a, _)" Sym.pp_hum sym

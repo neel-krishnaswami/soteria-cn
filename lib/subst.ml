@@ -43,13 +43,14 @@ let rec assign_pattern subst (pat : pattern) (v : Core_value.t) : t Csymex.t =
             (Fmt.Dump.list Mu.pp_pattern)
             pats)
 
-let from_args (args : Mu.arguments) (params : Core_value.t list) : t =
+let from_args ?(init = empty) (args : Mu.arguments) (params : Core_value.t list)
+    : t =
   List.fold_left2
     (fun acc ((arg, _) : Mu.computational_arg * _) param ->
       match arg with
       | Computational (sym, _) -> add sym param acc
       | Ghost _ -> L.failwith "Unsupported ghost arguments")
-    empty args.comp params
+    init args.comp params
 
 type term = Cn.(BaseTypes.t Terms.term)
 type annot = Cn.(BaseTypes.t Terms.annot)

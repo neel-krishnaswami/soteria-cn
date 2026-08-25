@@ -559,6 +559,10 @@ module Make (Symex : Symex.Base) (MemVal : MemVal(Symex).S) = struct
 
   let is_empty t = Option.is_none t.bound && Tree.is_empty t.root
 
+  (* The block owns no bytes, though its allocation bound may remain (e.g. a
+     stack block whose ownership was consumed by a loop invariant). *)
+  let owns_nothing t = Tree.is_empty t.root
+
   let pp_pretty ft t =
     let open PrintBox in
     let r = ref [] in
